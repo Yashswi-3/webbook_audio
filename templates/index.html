@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WebBook Audio Reader</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2e38;
+    --text: #e7e9ee;
+    --muted: #9aa1ac;
+    --accent: #5b8cff;
+    --ok: #35c17e;
+    --err: #ff5d5d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    max-width: 720px;
+    margin: 40px auto;
+    padding: 0 20px;
+  }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  p.subtitle { color: var(--muted); margin-top: 0; font-size: 14px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+  label {
+    display: block;
+    font-size: 13px;
+    color: var(--muted);
+    margin-bottom: 6px;
+    margin-top: 14px;
+  }
+  label:first-child { margin-top: 0; }
+  input[type=text], input[type=number], select {
+    width: 100%;
+    padding: 10px 12px;
+    background: #0f1218;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 14px;
+  }
+  input[type=range] { width: 100%; }
+  .row { display: flex; gap: 14px; }
+  .row > div { flex: 1; }
+  button {
+    margin-top: 20px;
+    width: 100%;
+    padding: 12px;
+    background: var(--accent);
+    border: none;
+    border-radius: 6px;
+    color: white;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .status-line { font-size: 14px; margin-bottom: 8px; }
+  .status-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+    background: #263043;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .status-badge.done { background: #17301f; color: var(--ok); }
+  .status-badge.error { background: #331a1a; color: var(--err); }
+  .progress-track {
+    width: 100%;
+    height: 8px;
+    background: #0f1218;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    overflow: hidden;
+    margin: 10px 0 4px;
+  }
+  .progress-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 999px;
+    width: 0%;
+    transition: width 0.4s ease;
+  }
+  .progress-fill.done { background: var(--ok); }
+  .progress-fill.error { background: var(--err); }
+  .progress-percent {
+    font-size: 12px;
+    color: var(--muted);
+    text-align: right;
+  }
+  #pageLog {
+    max-height: 240px;
+    overflow-y: auto;
+    font-size: 13px;
+    border-top: 1px solid var(--border);
+    margin-top: 12px;
+    padding-top: 12px;
+  }
+  .page-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 0;
+    color: var(--muted);
+  }
+  .page-row.ok { color: var(--text); }
+  .page-row.fail { color: var(--err); }
+  .downloads { display: flex; gap: 10px; }
+  .downloads a {
+    flex: 1;
+    text-align: center;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    text-decoration: none;
+    font-size: 14px;
+  }
+  .downloads a.disabled { opacity: 0.4; pointer-events: none; }
+  .speed-value { color: var(--text); font-size: 13px; float: right; }
+  .field-hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .divider-label {
+    text-align: center;
+    color: var(--muted);
+    font-size: 12px;
+    letter-spacing: 0.05em;
+    margin-bottom: 14px;
+  }
+  input[type=file] {
+    width: 100%;
+    padding: 10px 12px;
+    background: #0f1218;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 13px;
+  }
+  input[type=file]::file-selector-button {
+    background: var(--accent);
+    border: none;
+    border-radius: 4px;
+    color: white;
+    padding: 6px 12px;
+    margin-right: 10px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+</style>
+</head>
+<body>
+
+  <h1>WebBook Audio Reader</h1>
+  <p class="subtitle">Turn a multi-page article or online book you're authorized to read into one audiobook.</p>
+
+  <div class="panel">
+    <label for="url">Starting URL</label>
+    <input type="text" id="url" placeholder="https://example.com/chapter1">
+
+    <div class="row">
+      <div>
+        <label for="maxPages">Number of Pages/Chapters</label>
+        <input type="number" id="maxPages" min="1" max="{{ max_pages_hard_cap }}"
+               value="{{ max_pages_default }}" step="1">
+        <div class="field-hint">1–{{ max_pages_hard_cap }}</div>
+      </div>
+      <div>
+        <label for="voice">Voice</label>
+        <select id="voice">
+          {% for v in voices %}
+          <option value="{{ v }}">{{ v }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+
+    <label for="speed">Reading Speed <span class="speed-value" id="speedValue">1.0x</span></label>
+    <input type="range" id="speed" min="0.75" max="1.5" step="0.25" value="1.0">
+
+    <button id="startBtn">Start</button>
+  </div>
+
+  <div class="panel">
+    <div class="divider-label">— or —</div>
+    <label for="fileInput">Upload a .txt file to convert to audio</label>
+    <input type="file" id="fileInput" accept=".txt,text/plain">
+    <div class="field-hint">Already have the text? Skip the crawl and go straight to audio. Max {{ max_upload_size_mb }} MB.</div>
+    <button id="uploadBtn">Convert Uploaded File</button>
+  </div>
+
+  <div class="panel">
+    <div class="status-line">
+      Status: <span class="status-badge" id="statusBadge">idle</span>
+    </div>
+    <div class="status-line" id="statusMessage" style="color: var(--muted);">Waiting to start.</div>
+    <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+    <div class="progress-percent" id="progressPercent">0%</div>
+    <div class="status-line" id="pageCount" style="color: var(--muted);"></div>
+
+    <div id="pageLog"></div>
+  </div>
+
+  <div class="panel downloads">
+    <a href="/download/txt" id="downloadTxt" class="disabled">Download TXT</a>
+    <a href="/download/mp3" id="downloadMp3" class="disabled">Download MP3</a>
+  </div>
+
+<script>
+const startBtn = document.getElementById('startBtn');
+const uploadBtn = document.getElementById('uploadBtn');
+const fileInput = document.getElementById('fileInput');
+const speedSlider = document.getElementById('speed');
+const speedValue = document.getElementById('speedValue');
+const statusBadge = document.getElementById('statusBadge');
+const statusMessage = document.getElementById('statusMessage');
+const pageCount = document.getElementById('pageCount');
+const progressFill = document.getElementById('progressFill');
+const progressPercent = document.getElementById('progressPercent');
+const pageLog = document.getElementById('pageLog');
+const downloadTxt = document.getElementById('downloadTxt');
+const downloadMp3 = document.getElementById('downloadMp3');
+
+let pollTimer = null;
+
+speedSlider.addEventListener('input', () => {
+  speedValue.textContent = parseFloat(speedSlider.value).toFixed(2).replace(/0$/, '') + 'x';
+});
+
+function beginJobUI() {
+  startBtn.disabled = true;
+  uploadBtn.disabled = true;
+  pageLog.innerHTML = '';
+  downloadTxt.classList.add('disabled');
+  downloadMp3.classList.add('disabled');
+  progressFill.style.width = '0%';
+  progressFill.className = 'progress-fill';
+  progressPercent.textContent = '0%';
+}
+
+function endJobUIOnFailure() {
+  startBtn.disabled = false;
+  uploadBtn.disabled = false;
+}
+
+function beginPolling() {
+  pollTimer = setInterval(poll, 1200);
+}
+
+startBtn.addEventListener('click', async () => {
+  const url = document.getElementById('url').value.trim();
+  if (!url) { alert('Please enter a starting URL.'); return; }
+
+  const maxPagesInput = document.getElementById('maxPages');
+  const maxPagesLimit = parseInt(maxPagesInput.max, 10) || 100;
+  let maxPages = parseInt(maxPagesInput.value, 10);
+  if (!maxPages || maxPages < 1) maxPages = 1;
+  if (maxPages > maxPagesLimit) maxPages = maxPagesLimit;
+  maxPagesInput.value = maxPages;
+
+  const payload = {
+    url: url,
+    max_pages: maxPages,
+    voice: document.getElementById('voice').value,
+    speed: speedSlider.value,
+  };
+
+  beginJobUI();
+
+  const res = await fetch('/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+
+  if (!data.ok) {
+    alert(data.error || 'Failed to start.');
+    endJobUIOnFailure();
+    return;
+  }
+
+  beginPolling();
+});
+
+uploadBtn.addEventListener('click', async () => {
+  const file = fileInput.files[0];
+  if (!file) { alert('Please choose a .txt file first.'); return; }
+  if (!file.name.toLowerCase().endsWith('.txt')) {
+    alert('Only .txt files are supported.');
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('voice', document.getElementById('voice').value);
+  formData.append('speed', speedSlider.value);
+
+  beginJobUI();
+
+  const res = await fetch('/start_from_file', {
+    method: 'POST',
+    body: formData,
+  });
+  const data = await res.json();
+
+  if (!data.ok) {
+    alert(data.error || 'Failed to start.');
+    endJobUIOnFailure();
+    return;
+  }
+
+  beginPolling();
+});
+
+async function poll() {
+  const res = await fetch('/progress');
+  const s = await res.json();
+
+  statusBadge.textContent = (s.status || '').replace(/_/g, ' ');
+  statusBadge.className = 'status-badge' + (s.status === 'done' ? ' done' : (s.status === 'error' ? ' error' : ''));
+  statusMessage.textContent = s.message || '';
+  pageCount.textContent = `Collected ${s.pages_done} / ${s.max_pages}`;
+
+  const pct = typeof s.percent === 'number' ? s.percent : 0;
+  progressFill.style.width = pct + '%';
+  progressFill.className = 'progress-fill' + (s.status === 'done' ? ' done' : (s.status === 'error' ? ' error' : ''));
+  progressPercent.textContent = pct + '%';
+
+  pageLog.innerHTML = '';
+  (s.page_log || []).forEach(p => {
+    const row = document.createElement('div');
+    row.className = 'page-row ' + (p.ok ? 'ok' : 'fail');
+    row.innerHTML = `<span>Page ${p.page}: ${p.title || p.url}</span><span>${p.ok ? (p.words + ' words') : (p.note || 'failed')}</span>`;
+    pageLog.appendChild(row);
+  });
+
+  if (s.txt_ready) downloadTxt.classList.remove('disabled');
+  if (s.mp3_ready) downloadMp3.classList.remove('disabled');
+
+  if (!s.running) {
+    clearInterval(pollTimer);
+    startBtn.disabled = false;
+    uploadBtn.disabled = false;
+  }
+}
+</script>
+
+</body>
+</html>

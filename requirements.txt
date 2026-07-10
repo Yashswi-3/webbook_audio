@@ -1,0 +1,7 @@
+flask
+requests
+beautifulsoup4
+trafilatura
+edge-tts
+pydub
+playwright
