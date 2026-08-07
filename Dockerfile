@@ -18,4 +18,5 @@ COPY . .
 ENV PORT=10000
 EXPOSE 10000
 
-CMD ["gunicorn", "-w", "1", "-b", "0.0.0.0:10000", "--timeout", "600", "app:app"]
+# shell form so $PORT expands - Render assigns the port at runtime
+CMD gunicorn -w 1 -b 0.0.0.0:$PORT --timeout 600 app:app

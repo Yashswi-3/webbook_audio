@@ -1,7 +1,10 @@
 flask
+gunicorn
 requests
 beautifulsoup4
 trafilatura
 edge-tts
 pydub
-playwright
+# playwright: omitted on purpose - the Dockerfile doesn't install Chromium,
+# so app.py's requests-based fallback handles crawling. Install locally if
+# you need JS-rendered pages.
