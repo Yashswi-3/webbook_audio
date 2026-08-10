@@ -103,6 +103,7 @@ job_state = {
     "error": None,
     "audio_chunks_done": 0,
     "audio_chunks_total": 0,
+    "download_base": None,     # e.g. "That Time an American ... 300-332" -> used as the downloaded filename
 }
 
 # Rough percent-of-total weighting per stage, used only to drive the UI
@@ -151,6 +152,7 @@ def reset_job_state(max_pages):
             "error": None,
             "audio_chunks_done": 0,
             "audio_chunks_total": 0,
+            "download_base": None,
         })
 
 
@@ -339,6 +341,53 @@ def clean_text(text):
     text = "\n".join(cleaned_lines)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+# ----------------------------------------------------------------------------
+# Naming: figure out the book/novel title and chapter numbers, so downloads
+# get a real filename instead of a generic "book.mp3".
+# ----------------------------------------------------------------------------
+
+CHAPTER_WORD_RE = re.compile(r"^(chapter|ch\.?|episode|ep\.?|part)\s*#?\s*\d+", re.IGNORECASE)
+CHAPTER_NUM_RE = re.compile(r"chapter\s*#?\s*(\d+)", re.IGNORECASE)
+CHAPTER_NUM_URL_RE = re.compile(r"chapter[-_](\d+)", re.IGNORECASE)
+
+
+def extract_book_title(html, fallback_url):
+    """
+    Page <title> tags are usually "Chapter Title - Book Title | Site Name"
+    (or the reverse). Drop the site name, then prefer whichever segment
+    doesn't look like a chapter label.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    title_tag = soup.find("title")
+    raw = title_tag.get_text(strip=True) if title_tag else ""
+    raw = raw.split("|")[0].strip()
+
+    segments = [s.strip() for s in raw.split(" - ") if s.strip()]
+    candidates = [s for s in segments if not CHAPTER_WORD_RE.match(s)]
+    if candidates:
+        title = max(candidates, key=len)
+    elif segments:
+        title = segments[-1]
+    else:
+        title = urlparse(fallback_url).netloc
+
+    return title or urlparse(fallback_url).netloc
+
+
+def extract_chapter_number(chapter_title, url):
+    """Best-effort chapter number from the page's own title, else the URL slug."""
+    m = CHAPTER_NUM_RE.search(chapter_title or "")
+    if not m:
+        m = CHAPTER_NUM_URL_RE.search(url or "")
+    return int(m.group(1)) if m else None
+
+
+def sanitize_filename(name):
+    name = re.sub(r'[\\/:*?"<>|]', "", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name[:150] or "book"
 
 
 # ----------------------------------------------------------------------------
@@ -570,6 +619,7 @@ def run_pipeline(start_url, max_pages, voice, rate):
         current_url = start_url
         visited = set()
         page_num = 0
+        first_page_html = None
 
         while current_url and page_num < max_pages:
             if current_url in visited:
@@ -605,6 +655,9 @@ def run_pipeline(start_url, max_pages, voice, rate):
                 )
                 return
 
+            if first_page_html is None:
+                first_page_html = html
+
             title, raw_text = extract_article(html, current_url)
             text = clean_text(raw_text)
 
@@ -617,6 +670,7 @@ def run_pipeline(start_url, max_pages, voice, rate):
                 chapters.append({
                     "page": page_num, "url": current_url,
                     "title": title, "text": text,
+                    "chapter_num": extract_chapter_number(title, current_url),
                 })
                 append_page_log({
                     "page": page_num, "url": current_url, "title": title,
@@ -634,6 +688,11 @@ def run_pipeline(start_url, max_pages, voice, rate):
                          message="No readable content was collected.",
                          error="no_content")
             return
+
+        book_title = extract_book_title(first_page_html, start_url) if first_page_html else urlparse(start_url).netloc
+        nums = [c["chapter_num"] for c in chapters if c.get("chapter_num") is not None]
+        chapter_range = f"{min(nums)}-{max(nums)}" if nums else f"{chapters[0]['page']}-{chapters[-1]['page']}"
+        update_state(download_base=sanitize_filename(f"{book_title} {chapter_range}"))
 
         update_state(status="writing", message="Merging pages into book.txt...")
         book_text = build_book_text(chapters)
@@ -676,7 +735,8 @@ def run_pipeline_from_text(raw_text, source_name, voice, rate):
     used when the user uploads a .txt file directly instead of a URL.
     """
     try:
-        update_state(status="writing", message=f"Reading {source_name}...")
+        update_state(status="writing", message=f"Reading {source_name}...",
+                      download_base=sanitize_filename(os.path.splitext(source_name)[0]))
 
         text = clean_text(raw_text)
         if not text:
@@ -852,7 +912,10 @@ def download(kind):
     if not os.path.exists(path):
         return jsonify({"ok": False, "error": "File not ready yet"}), 404
 
-    return send_from_directory(OUTPUT_FOLDER, filename, as_attachment=True)
+    base = job_state.get("download_base")
+    download_name = f"{base}.{kind}" if base else filename
+    return send_from_directory(OUTPUT_FOLDER, filename, as_attachment=True,
+                                download_name=download_name)
 
 
 @app.errorhandler(413)
