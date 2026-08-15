@@ -158,6 +158,25 @@ def test_resolve_source_skips_network_probe_for_handler_sources():
         assert name is None and err
 
 
+def test_markdown_next_link():
+    md = ("Some text [end-users](https://x.test/a) more.\n"
+          "[Next](/s/123/45/) and [Previous](/s/123/43/)\n")
+    assert sources.find_next_link_markdown(md, "https://m.example.test/s/123/44/") \
+        == "https://m.example.test/s/123/45/"
+    assert sources.find_next_link_markdown("no links here", "https://x.test/") is None
+    # Must not follow anchors or javascript: hrefs.
+    assert sources.find_next_link_markdown("[Next](#bottom)", "https://x.test/") is None
+    assert sources.find_next_link_markdown(
+        "[Next](javascript:go())", "https://x.test/") is None
+
+
+def test_validate_url_lets_refusals_through():
+    # 404/410 are fatal; a 403 must not veto the job, because the Jina
+    # fallback in fetch_crawl routinely reads pages that refuse a direct
+    # fetch from a datacenter IP.
+    assert sources._FATAL_STATUS == {404, 410}
+
+
 def test_bot_check_detection():
     # The exact wording yt-dlp emits, as seen on the Render deploy.
     assert sources.blocked_by_bot_check(

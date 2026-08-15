@@ -337,6 +337,11 @@ def fetch_with_retry(url):
     return download_page_html(url)
 
 
+# Statuses that mean the page genuinely isn't there. Everything else 4xx/5xx
+# means "reachable, refusing this request", which the reader may still handle.
+_FATAL_STATUS = {404, 410}
+
+
 def validate_url(url):
     """
     (ok, error, content_type) — structural + public-target check, then a
@@ -356,8 +361,13 @@ def validate_url(url):
             # Plenty of servers mishandle HEAD; try GET before calling it dead.
             resp = requests.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True,
                                 headers={"User-Agent": USER_AGENT}, stream=True)
-            if resp.status_code >= 400:
+            if resp.status_code in _FATAL_STATUS:
                 return False, f"URL returned HTTP {resp.status_code}", ""
+            if resp.status_code >= 400:
+                # Reachable but refusing THIS request - typically a datacenter
+                # IP block, which the Jina fallback in fetch_crawl often gets
+                # past. Failing here would veto a page the job can still read.
+                return True, None, ""
     except requests.RequestException as e:
         return False, f"Could not reach URL: {e}", ""
 
@@ -464,7 +474,23 @@ def jina_read(url):
         title = m.group(1).strip()
 
     stripped = _JINA_HEADER_RE.sub("", text, count=1)
-    return title, markdown_to_speech_text(stripped)
+    # Raw markdown comes back too: it still has the page's links in it, which
+    # is the only way to keep following a chapter chain when the direct fetch
+    # is blocked and there is no HTML to run find_next_link over.
+    return title, markdown_to_speech_text(stripped), stripped
+
+
+_MD_NEXT_LINK_RE = re.compile(r"\[([^\]]{0,40})\]\(([^)\s]+)\)")
+
+
+def find_next_link_markdown(md, current_url):
+    """find_next_link's equivalent for Jina's markdown output."""
+    for label, href in _MD_NEXT_LINK_RE.findall(md or ""):
+        if NEXT_TEXT_RE.match(label.strip()):
+            if href.startswith("#") or href.lower().startswith("javascript:"):
+                continue
+            return urljoin(current_url, href)
+    return None
 
 
 def extract_article(html, url, allow_jina=True):
@@ -497,7 +523,7 @@ def extract_article(html, url, allow_jina=True):
 
     if allow_jina and len(best_text.split()) < MIN_ARTICLE_WORDS:
         try:
-            j_title, j_text = jina_read(url)
+            j_title, j_text, _ = jina_read(url)
             if len(j_text.split()) > len(best_text.split()):
                 best_title, best_text = (j_title or best_title), j_text
         except SourceError:
@@ -1055,6 +1081,7 @@ def fetch_crawl(url, max_pages, on_status, on_page):
     visited = set()
     page_num = 0
     first_page_html = None
+    book_title_override = None
 
     while current_url and page_num < max_pages:
         if current_url in visited:
@@ -1066,9 +1093,46 @@ def fetch_crawl(url, max_pages, on_status, on_page):
         html, err = fetch_with_retry(current_url)
 
         if html is None:
-            on_page({"page": page_num, "url": current_url, "title": None,
-                     "words": 0, "ok": False, "note": f"Failed: {err}"})
-            raise SourceError(f"Page {page_num} failed after retry: {err}")
+            # Direct fetch refused. Plenty of sites block datacenter IPs
+            # outright, so a deployed instance gets 403 on pages any browser
+            # loads fine. Jina reads from its own infrastructure, so try it
+            # before giving up on the page.
+            on_status(f"Page {page_num} refused the direct fetch, "
+                      "trying the reader...")
+            try:
+                j_title, j_text, j_md = jina_read(current_url)
+            except SourceError as jina_err:
+                on_page({"page": page_num, "url": current_url, "title": None,
+                         "words": 0, "ok": False, "note": f"Failed: {err}"})
+                raise SourceError(
+                    f"Page {page_num} could not be read. Direct fetch: {err}. "
+                    f"Reader: {jina_err}"
+                ) from None
+
+            text = clean_text(j_text)
+            if text:
+                chapters.append({
+                    "page": page_num, "url": current_url,
+                    "title": j_title or current_url, "text": text,
+                    "chapter_num": extract_chapter_number(j_title, current_url),
+                })
+                on_page({"page": page_num, "url": current_url,
+                         "title": j_title or current_url,
+                         "words": len(text.split()), "ok": True,
+                         "note": "Read via Jina (direct fetch blocked)"})
+            else:
+                on_page({"page": page_num, "url": current_url, "title": j_title,
+                         "words": 0, "ok": False, "note": "Empty article, skipped"})
+
+            if first_page_html is None and j_title:
+                book_title_override = j_title
+
+            next_url = find_next_link_markdown(j_md, current_url)
+            try:
+                current_url = normalize_public_url(next_url) if next_url else None
+            except ValueError:
+                current_url = None
+            continue
 
         # A feed handed in as a plain URL: hand off rather than scraping XML.
         if page_num == 1 and _FEED_SNIFF_RE.search(html[:2048]):
@@ -1111,8 +1175,11 @@ def fetch_crawl(url, max_pages, on_status, on_page):
     if not chapters:
         raise SourceError("No readable content was collected.")
 
-    return {"chapters": chapters,
-            "book_title": extract_book_title(first_page_html, start_url)}
+    if first_page_html is not None:
+        book_title = extract_book_title(first_page_html, start_url)
+    else:
+        book_title = book_title_override or urlparse(start_url).netloc
+    return {"chapters": chapters, "book_title": book_title}
 
 
 # ----------------------------------------------------------------------------
