@@ -1114,7 +1114,11 @@ _INDEX_LABEL_RE = re.compile(
     r"table of contents|catalog|contents|chapter list|all chapters|index",
     re.IGNORECASE,
 )
-MAX_INDEX_HOPS = 2
+MAX_INDEX_PAGES = 5
+# Conventional index paths, tried under the work's own URL when the pages we
+# can see carry no link to the contents. Not per-site rules: these are the
+# names serial-fiction sites reuse. Only reached after everything else failed.
+INDEX_PATH_GUESSES = ("catalog", "contents", "toc", "chapters")
 
 
 def _url_shape(url):
@@ -1151,21 +1155,51 @@ def _page_links(url):
     return out, title
 
 
-def find_chapter_links(links, index_url):
+_WORK_ID_RE = re.compile(r"\d{6,}")
+
+
+def work_ids(url):
+    """The long numeric ids in a URL, which identify the work it belongs to."""
+    return set(_WORK_ID_RE.findall(url or ""))
+
+
+def _belongs_to_work(url, ids, index_url):
+    """
+    Is this link part of the same book as the page the user pasted?
+
+    Without this test the largest link group on a book page is the
+    "recommended for you" carousel, and the crawler happily narrates the
+    first chapter of fifteen unrelated novels. Every chapter of one book
+    carries that book's id; every recommendation carries a different one.
+    """
+    if ids:
+        return bool(ids & work_ids(url))
+    # No id to match on, so fall back to "lives under the index page".
+    index_path = urlsplit(index_url).path.rstrip("/")
+    return urlsplit(url).path.startswith(index_path + "/") if index_path else False
+
+
+def find_chapter_links(links, index_url, ids=None):
     """
     Pick the chapter list out of a page's links.
 
     A table of contents is mostly one repeated link shape - every chapter has
     the same URL pattern differing only in its numbers - surrounded by site
     chrome that doesn't. So group by shape and take the biggest group, in
-    document order. No per-site rules.
+    document order, after discarding anything belonging to a different work.
+    No per-site rules.
     """
     host = urlsplit(index_url).netloc
+    if ids is None:
+        ids = work_ids(index_url)
+
     groups = {}
     for label, url in links:
         if urlsplit(url).netloc != host:
             continue                     # skip offsite chrome
         if url.rstrip("/") == index_url.rstrip("/"):
+            continue
+        if not _belongs_to_work(url, ids, index_url):
             continue
         groups.setdefault(_url_shape(url), []).append((label, url))
 
@@ -1193,6 +1227,19 @@ def _parent_url(url):
     return f"{parsed.scheme}://{parsed.netloc}{trimmed}"
 
 
+def _work_root(url, ids):
+    """
+    The shallowest URL still identifying this work - the book page, given a
+    chapter page. Conventional index paths hang off this, not off the chapter.
+    """
+    candidate = url
+    while True:
+        parent = _parent_url(candidate)
+        if not parent or (ids and not (ids & work_ids(parent))):
+            return candidate
+        candidate = parent
+
+
 def discover_chapter_list(url, on_status):
     """
     Find the site's chapter list starting from whatever page the user pasted.
@@ -1202,39 +1249,50 @@ def discover_chapter_list(url, on_status):
     again. Entirely label- and shape-driven, so it isn't tied to any one site.
     Returns [(label, url)] in the order the site lists them.
     """
-    seen_pages = set()
-    current = url
+    # Taken from the URL the user pasted, so hopping to the book page can't
+    # drift onto a different book's links.
+    ids = work_ids(url)
 
-    for _ in range(MAX_INDEX_HOPS):
-        if not current or current in seen_pages:
-            break
-        seen_pages.add(current)
+    seen = set()
+    queue = [url]
+    guessed = False
+
+    while queue and len(seen) < MAX_INDEX_PAGES:
+        current = queue.pop(0)
+        if not current or current in seen:
+            continue
+        seen.add(current)
 
         try:
             links, _title = _page_links(current)
         except SourceError:
-            break
+            links = []
 
-        found = find_chapter_links(links, current)
+        found = find_chapter_links(links, current, ids)
         if len(found) >= MIN_INDEX_LINKS:
             return found
 
-        # Not an index page. Follow something that looks like one...
-        nxt = None
+        # Not an index page. Queue anything labelled like the contents...
         for label, href in links:
             if _INDEX_LABEL_RE.search(label) or _INDEX_LABEL_RE.search(href):
-                nxt = href
-                break
+                queue.append(href)
 
-        # ...or failing that, walk up one path segment. A chapter usually
-        # lives under its book, and the book page is what lists the chapters.
-        if nxt is None:
-            nxt = _parent_url(current)
+        # ...the page one segment up, since a chapter lives under its book and
+        # the book page is what lists the chapters. Only while the id is still
+        # in the path: above that we've left the work behind and would just be
+        # reading the site's front page.
+        parent = _parent_url(current)
+        if parent and (not ids or ids & work_ids(parent)):
+            queue.append(parent)
 
-        if nxt is None or nxt in seen_pages:
-            break
-        on_status("Looking for the chapter list...")
-        current = nxt
+        # ...and, once everything else is exhausted, the conventional index
+        # paths under the work's own URL. Some sites render their contents
+        # link with JavaScript, so it never reaches us to be followed.
+        if not queue and not guessed:
+            guessed = True
+            base = _work_root(url, ids)
+            queue.extend(f"{base.rstrip('/')}/{seg}" for seg in INDEX_PATH_GUESSES)
+            on_status("Looking for the chapter list...")
 
     return []
 

@@ -216,6 +216,40 @@ def test_find_chapter_links_picks_the_biggest_group():
     assert sources.find_chapter_links(few, index) == []
 
 
+def test_chapter_links_reject_other_works():
+    """
+    Regression: the largest link group on a book page was the "recommended
+    for you" carousel, so the crawler narrated the first chapter of fifteen
+    unrelated novels. Chapters of one book share that book's id; every
+    recommendation carries a different one.
+    """
+    index = "https://m.x.test/book/35069975308849905"
+    ids = sources.work_ids(
+        "https://m.x.test/book/35069975308849905/97494949762745599")
+
+    recommendations = [(f"Some Other Novel {n}", f"https://m.x.test/book/3179471110087{n:04d}")
+                       for n in range(20)]
+    chapters = [(f"Chapter {n}", f"https://m.x.test/book/35069975308849905/9424742338742{n:04d}")
+                for n in range(10)]
+
+    picked = sources.find_chapter_links(recommendations + chapters, index, ids)
+    assert len(picked) == 10, "must pick the chapters, not the bigger carousel"
+    for _label, url in picked:
+        assert "35069975308849905" in url, f"different book leaked in: {url}"
+
+    # With only the carousel present, finding nothing beats finding the wrong book.
+    assert sources.find_chapter_links(recommendations, index, ids) == []
+
+
+def test_work_root_stops_at_the_book():
+    ids = sources.work_ids("https://x.test/book/12345678/99887766")
+    assert sources._work_root("https://x.test/book/12345678/99887766", ids) \
+        == "https://x.test/book/12345678"
+    # Already at the book page: stay there, don't climb to /book.
+    assert sources._work_root("https://x.test/book/12345678", ids) \
+        == "https://x.test/book/12345678"
+
+
 def test_bot_check_detection():
     # The exact wording yt-dlp emits, as seen on the Render deploy.
     assert sources.blocked_by_bot_check(
