@@ -183,11 +183,12 @@
 <body>
 
   <h1>WebBook Audio Reader</h1>
-  <p class="subtitle">Turn a multi-page article or online book you're authorized to read into one audiobook.</p>
+  <p class="subtitle">Paste any link you're authorized to read — an article chain, a YouTube video, a feed, a GitHub repo — and get one audiobook back.</p>
 
   <div class="panel">
     <label for="url">Starting URL</label>
     <input type="text" id="url" placeholder="https://example.com/chapter1">
+    <div class="field-hint" id="sourceHint">Article chains &middot; YouTube captions &middot; RSS/Atom feeds &middot; GitHub docs</div>
 
     <div class="row">
       <div>
@@ -253,6 +254,28 @@ const downloadTxt = document.getElementById('downloadTxt');
 const downloadMp3 = document.getElementById('downloadMp3');
 
 let pollTimer = null;
+
+// Live "what will this be read as" hint under the URL box.
+const urlInput = document.getElementById('url');
+const sourceHint = document.getElementById('sourceHint');
+const DEFAULT_HINT = sourceHint.textContent;
+let detectTimer = null;
+
+urlInput.addEventListener('input', () => {
+  clearTimeout(detectTimer);
+  detectTimer = setTimeout(async () => {
+    const url = urlInput.value.trim();
+    if (!url) { sourceHint.textContent = DEFAULT_HINT; return; }
+    try {
+      const res = await fetch('/detect?url=' + encodeURIComponent(url));
+      const data = await res.json();
+      sourceHint.textContent = data.label ? 'Will read as: ' + data.label
+                                          : DEFAULT_HINT;
+    } catch (e) {
+      sourceHint.textContent = DEFAULT_HINT;
+    }
+  }, 350);
+});
 
 speedSlider.addEventListener('input', () => {
   speedValue.textContent = parseFloat(speedSlider.value).toFixed(2).replace(/0$/, '') + 'x';

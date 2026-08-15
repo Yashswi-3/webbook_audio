@@ -1,15 +1,19 @@
 """
-WebBook Audio Reader
----------------------
+WebBook Audio Reader — v2
+-------------------------
 A small Flask app that:
-  1. Takes a starting URL
-  2. Crawls forward through a chain of "next page" links (up to a max page count)
-  3. Extracts the readable article text from each page (trafilatura -> BeautifulSoup fallback)
-  4. Merges everything into a single book.txt
-  5. Converts book.txt into a single book.mp3 using edge-tts (chunked + merged with pydub)
+  1. Takes a URL (or an uploaded .txt)
+  2. Routes it to the right reader — see sources.py:
+       YouTube  -> captions via yt-dlp
+       GitHub   -> README + docs via the public API
+       RSS/Atom -> one chapter per entry
+       anything else -> the "next page" crawler, with a Jina Reader rescue
+         for pages the local extractors can't read
+  3. Merges everything into a single book.txt
+  4. Converts it into a single book.mp3 using edge-tts (chunked, merged by ffmpeg)
 
-Intended for content you are authorized to access and convert for your own personal use
-(e.g. documentation, tutorials, manuals, or books you already have the right to read).
+Intended for content you are authorized to access and convert for your own
+personal use. Nothing here bypasses a login, paywall, or CAPTCHA.
 
 Run with:
     python app.py
@@ -19,28 +23,15 @@ Then open http://127.0.0.1:5000
 import asyncio
 import glob
 import os
-import re
 import subprocess
 import threading
-import time
 import traceback
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
-import requests
-from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request, send_from_directory, render_template
 
-# Optional heavy deps - imported lazily / guarded so the app can still start
-# even if one of them isn't installed yet (with a clear error message later).
-try:
-    import trafilatura
-except ImportError:
-    trafilatura = None
-
-try:
-    from playwright.sync_api import sync_playwright
-except ImportError:
-    sync_playwright = None
+import sources
+from sources import SourceError
 
 try:
     import edge_tts
@@ -58,19 +49,12 @@ except ImportError:
 # ----------------------------------------------------------------------------
 
 MAX_PAGES_DEFAULT = 25
-MAX_PAGES_HARD_CAP = 100          # absolute ceiling regardless of what the user requests
+MAX_PAGES_HARD_CAP = 100          # absolute ceiling regardless of the request
 VOICE_DEFAULT = "en-IN-NeerjaNeural"
-RATE_DEFAULT = "+0%"
 OUTPUT_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 WORDS_PER_CHUNK = 3000
-MAX_CONCURRENT_TTS = 5              # how many edge-tts chunk requests run at once
-REQUEST_TIMEOUT = 20               # seconds
+MAX_CONCURRENT_TTS = 5             # how many edge-tts chunk requests run at once
 MAX_UPLOAD_SIZE_MB = 25            # cap on uploaded .txt file size
-PAGE_LOAD_WAIT_MS = 2500           # ms to let JS settle when using Playwright
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 WebBookAudioReader/1.0"
-)
 
 AVAILABLE_VOICES = [
     "en-IN-NeerjaNeural",
@@ -93,17 +77,19 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 job_lock = threading.Lock()
 job_state = {
     "running": False,
-    "status": "idle",          # idle | collecting | writing | generating_audio | merging_audio | done | error | stopped
+    "status": "idle",          # idle | collecting | writing | generating_audio
+                               # | merging_audio | done | error
     "message": "",
+    "source": None,            # web | youtube | github | rss | upload
     "pages_done": 0,
     "max_pages": MAX_PAGES_DEFAULT,
-    "page_log": [],            # list of {"page": n, "url": ..., "title": ..., "words": n, "ok": bool}
+    "page_log": [],            # {"page", "url", "title", "words", "ok", "note"}
     "txt_ready": False,
     "mp3_ready": False,
     "error": None,
     "audio_chunks_done": 0,
     "audio_chunks_total": 0,
-    "download_base": None,     # e.g. "That Time an American ... 300-332" -> used as the downloaded filename
+    "download_base": None,     # e.g. "That Time an American 300-332"
 }
 
 # Rough percent-of-total weighting per stage, used only to drive the UI
@@ -116,7 +102,6 @@ STAGE_PERCENT_RANGE = {
     "merging_audio": (90, 98),
     "done": (100, 100),
     "error": (0, 0),
-    "stopped": (0, 0),
 }
 
 
@@ -138,12 +123,13 @@ def compute_percent(state):
     return round(start + (end - start) * frac)
 
 
-def reset_job_state(max_pages):
+def reset_job_state(max_pages, source=None):
     with job_lock:
         job_state.update({
             "running": True,
             "status": "collecting",
             "message": "Starting...",
+            "source": source,
             "pages_done": 0,
             "max_pages": max_pages,
             "page_log": [],
@@ -175,262 +161,7 @@ def get_state_snapshot():
 
 
 # ----------------------------------------------------------------------------
-# Step 1: URL validation
-# ----------------------------------------------------------------------------
-
-def validate_url(url):
-    """Basic structural validation + a lightweight reachability check."""
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        return False, "URL must be a full http(s) URL, e.g. https://example.com/page"
-
-    try:
-        resp = requests.head(
-            url, timeout=REQUEST_TIMEOUT, allow_redirects=True,
-            headers={"User-Agent": USER_AGENT}
-        )
-        if resp.status_code >= 400:
-            # Some servers don't support HEAD properly; fall back to GET before failing.
-            resp = requests.get(
-                url, timeout=REQUEST_TIMEOUT, allow_redirects=True,
-                headers={"User-Agent": USER_AGENT}, stream=True
-            )
-            if resp.status_code >= 400:
-                return False, f"URL returned HTTP {resp.status_code}"
-    except requests.RequestException as e:
-        return False, f"Could not reach URL: {e}"
-
-    return True, None
-
-
-# ----------------------------------------------------------------------------
-# Step 2: Page download (Playwright preferred, requests fallback)
-# ----------------------------------------------------------------------------
-
-def download_page_html(url):
-    """
-    Returns fully rendered HTML for a URL.
-    Uses Playwright (handles JS-rendered pages) if available, otherwise
-    falls back to a plain requests GET (works fine for static pages).
-    """
-    if sync_playwright is not None:
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page(user_agent=USER_AGENT)
-                page.goto(url, timeout=REQUEST_TIMEOUT * 1000, wait_until="load")
-                page.wait_for_timeout(PAGE_LOAD_WAIT_MS)
-                html = page.content()
-                browser.close()
-                return html, None
-        except Exception as e:
-            # Fall through to requests-based fetch below.
-            playwright_error = str(e)
-    else:
-        playwright_error = None
-
-    try:
-        resp = requests.get(
-            url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT}
-        )
-        resp.raise_for_status()
-        return resp.text, None
-    except requests.RequestException as e:
-        detail = f"{e}"
-        if playwright_error:
-            detail += f" (Playwright also failed: {playwright_error})"
-        return None, detail
-
-
-def fetch_with_retry(url):
-    """Fetch a page, retrying once on failure/timeout, per the spec's error handling."""
-    html, err = download_page_html(url)
-    if html is not None:
-        return html, None
-    # one retry
-    time.sleep(1.5)
-    html, err = download_page_html(url)
-    return html, err
-
-
-# ----------------------------------------------------------------------------
-# Step 3: Text extraction
-# ----------------------------------------------------------------------------
-
-NAV_LABEL_PATTERNS = [
-    r"^\s*(home|menu|search|login|sign in|sign up|subscribe)\s*$",
-    r"^\s*(share this|share on \w+|follow us)\s*$",
-    r"^\s*(accept cookies|we use cookies|cookie policy)\s*$",
-    r"^\s*(next|previous|prev|back|continue reading)\s*$",
-]
-NAV_LABEL_RE = re.compile("|".join(NAV_LABEL_PATTERNS), re.IGNORECASE)
-
-
-def extract_with_bs4(html, base_url):
-    """Fallback extractor: strips obvious chrome and keeps likely article text."""
-    soup = BeautifulSoup(html, "html.parser")
-
-    for tag_name in ["nav", "header", "footer", "aside", "script", "style",
-                      "form", "noscript", "iframe"]:
-        for tag in soup.find_all(tag_name):
-            tag.decompose()
-
-    # Drop elements that look like ads / popups / comments / sidebars by class or id.
-    junk_hints = re.compile(
-        r"(nav|menu|sidebar|footer|header|advert|ads|banner|cookie|popup|modal|"
-        r"comment|share|social|newsletter|subscribe|breadcrumb)",
-        re.IGNORECASE,
-    )
-    for tag in soup.find_all(attrs={"class": junk_hints}):
-        tag.decompose()
-    for tag in soup.find_all(attrs={"id": junk_hints}):
-        tag.decompose()
-
-    # Prefer <article>, then <main>, then the whole body.
-    container = soup.find("article") or soup.find("main") or soup.body or soup
-
-    title_tag = soup.find("h1") or soup.find("title")
-    title = title_tag.get_text(strip=True) if title_tag else base_url
-
-    paragraphs = []
-    for el in container.find_all(["p", "li", "h2", "h3", "h4", "blockquote"]):
-        text = el.get_text(" ", strip=True)
-        if not text:
-            continue
-        if NAV_LABEL_RE.match(text):
-            continue
-        paragraphs.append(text)
-
-    body_text = "\n\n".join(paragraphs)
-    return title, body_text
-
-
-def extract_article(html, url):
-    """
-    Preferred order: trafilatura, then BeautifulSoup fallback.
-    Returns (title, text).
-    """
-    if trafilatura is not None:
-        try:
-            extracted = trafilatura.extract(
-                html, url=url, include_comments=False, include_tables=False,
-                favor_precision=True,
-            )
-            if extracted and len(extracted.strip()) > 0:
-                meta = trafilatura.extract_metadata(html, default_url=url)
-                title = (meta.title if meta and meta.title else url)
-                return title, extracted.strip()
-        except Exception:
-            pass  # fall back below
-
-    return extract_with_bs4(html, url)
-
-
-def clean_text(text):
-    """Collapse whitespace, drop residual nav-label lines and cookie/share boilerplate."""
-    lines = [ln.strip() for ln in text.splitlines()]
-    cleaned_lines = []
-    for ln in lines:
-        if not ln:
-            continue
-        if NAV_LABEL_RE.match(ln):
-            continue
-        ln = re.sub(r"[ \t]+", " ", ln)
-        cleaned_lines.append(ln)
-
-    text = "\n".join(cleaned_lines)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-# ----------------------------------------------------------------------------
-# Naming: figure out the book/novel title and chapter numbers, so downloads
-# get a real filename instead of a generic "book.mp3".
-# ----------------------------------------------------------------------------
-
-CHAPTER_WORD_RE = re.compile(r"^(chapter|ch\.?|episode|ep\.?|part)\s*#?\s*\d+", re.IGNORECASE)
-CHAPTER_NUM_RE = re.compile(r"chapter\s*#?\s*(\d+)", re.IGNORECASE)
-CHAPTER_NUM_URL_RE = re.compile(r"chapter[-_](\d+)", re.IGNORECASE)
-
-
-def extract_book_title(html, fallback_url):
-    """
-    Page <title> tags are usually "Chapter Title - Book Title | Site Name"
-    (or the reverse). Drop the site name, then prefer whichever segment
-    doesn't look like a chapter label.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    title_tag = soup.find("title")
-    raw = title_tag.get_text(strip=True) if title_tag else ""
-    raw = raw.split("|")[0].strip()
-
-    segments = [s.strip() for s in raw.split(" - ") if s.strip()]
-    candidates = [s for s in segments if not CHAPTER_WORD_RE.match(s)]
-    if candidates:
-        title = max(candidates, key=len)
-    elif segments:
-        title = segments[-1]
-    else:
-        title = urlparse(fallback_url).netloc
-
-    return title or urlparse(fallback_url).netloc
-
-
-def extract_chapter_number(chapter_title, url):
-    """Best-effort chapter number from the page's own title, else the URL slug."""
-    m = CHAPTER_NUM_RE.search(chapter_title or "")
-    if not m:
-        m = CHAPTER_NUM_URL_RE.search(url or "")
-    return int(m.group(1)) if m else None
-
-
-def sanitize_filename(name):
-    name = re.sub(r'[\\/:*?"<>|]', "", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name[:150] or "book"
-
-
-# ----------------------------------------------------------------------------
-# Step: find the "next page" link
-# ----------------------------------------------------------------------------
-
-NEXT_TEXT_RE = re.compile(
-    r"^\s*(next( page)?|continue( reading)?|»|›|>>|read more)\s*$",
-    re.IGNORECASE,
-)
-
-
-def find_next_link(html, current_url):
-    """
-    Looks for a "next page" link using, in order:
-      1. <link rel="next" href="...">
-      2. <a rel="next" href="...">
-      3. An <a> whose visible text matches common "next" wording (Next, Continue, », ›, >>)
-    Returns an absolute URL or None.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-
-    link_rel = soup.find("link", rel=lambda v: v and "next" in v)
-    if link_rel and link_rel.get("href"):
-        return urljoin(current_url, link_rel["href"])
-
-    a_rel = soup.find("a", rel=lambda v: v and "next" in v)
-    if a_rel and a_rel.get("href"):
-        return urljoin(current_url, a_rel["href"])
-
-    for a in soup.find_all("a", href=True):
-        text = a.get_text(" ", strip=True)
-        if text and NEXT_TEXT_RE.match(text):
-            href = a["href"]
-            if href.startswith("#") or href.lower().startswith("javascript:"):
-                continue
-            return urljoin(current_url, href)
-
-    return None
-
-
-# ----------------------------------------------------------------------------
-# Step 4: Merge chapters
+# Merging chapters into book.txt
 # ----------------------------------------------------------------------------
 
 def build_book_text(chapters):
@@ -438,7 +169,7 @@ def build_book_text(chapters):
     parts = []
     for ch in chapters:
         parts.append("=" * 40)
-        parts.append(f"PAGE {ch['page']}")
+        parts.append(f"PAGE {ch['page']}: {ch.get('title') or ''}".rstrip(": "))
         parts.append(ch["url"])
         parts.append("=" * 40)
         parts.append("")
@@ -447,8 +178,20 @@ def build_book_text(chapters):
     return "\n".join(parts).strip() + "\n"
 
 
+def build_download_base(chapters, book_title):
+    """"Book Title 300-332" when the range is meaningful, else just the title."""
+    if len(chapters) <= 1:
+        return sources.sanitize_filename(book_title)
+    nums = [c["chapter_num"] for c in chapters if c.get("chapter_num") is not None]
+    if nums:
+        span = f"{min(nums)}-{max(nums)}"
+    else:
+        span = f"{chapters[0]['page']}-{chapters[-1]['page']}"
+    return sources.sanitize_filename(f"{book_title} {span}")
+
+
 # ----------------------------------------------------------------------------
-# Step 5: Audio generation
+# Audio generation
 # ----------------------------------------------------------------------------
 
 def split_into_word_chunks(text, words_per_chunk=WORDS_PER_CHUNK):
@@ -467,8 +210,8 @@ async def _tts_chunk_to_file(text, out_path, voice, rate):
 
 
 async def _generate_chunks_concurrently(chunks, out_folder, voice, rate,
-                                         progress_cb=None,
-                                         max_concurrent=MAX_CONCURRENT_TTS):
+                                        progress_cb=None,
+                                        max_concurrent=MAX_CONCURRENT_TTS):
     """
     Runs all chunk TTS requests concurrently (bounded by a semaphore so we
     don't blast edge-tts with unlimited parallel connections / risk being
@@ -533,6 +276,12 @@ def _merge_via_pydub(part_paths, final_path):
     re-encode to mp3. Only used if the fast ffmpeg concat path fails for
     some reason (e.g. ffmpeg missing from PATH, mismatched stream params).
     """
+    if AudioSegment is None:
+        raise RuntimeError(
+            "ffmpeg concat failed and pydub isn't usable, so there's no way "
+            "to merge the audio. Install ffmpeg and put it on your PATH "
+            "(recommended), or run: pip install pydub audioop-lts"
+        )
     combined = AudioSegment.empty()
     for p in part_paths:
         combined += AudioSegment.from_file(p, format="mp3")
@@ -540,7 +289,7 @@ def _merge_via_pydub(part_paths, final_path):
 
 
 def generate_audio(text, out_folder, voice, rate, progress_cb=None,
-                    on_merge_start=None, max_concurrent=MAX_CONCURRENT_TTS):
+                   on_merge_start=None, max_concurrent=MAX_CONCURRENT_TTS):
     """
     Splits text into chunks, generates part{n}.mp3 via edge-tts (chunks run
     concurrently, bounded by max_concurrent), merges into book.mp3 via a
@@ -549,14 +298,11 @@ def generate_audio(text, out_folder, voice, rate, progress_cb=None,
     book.mp3.
     """
     if edge_tts is None:
-        raise RuntimeError(
-            "edge-tts is not installed. Run: pip install edge-tts"
-        )
-    if AudioSegment is None:
-        raise RuntimeError(
-            "pydub is not installed (or ffmpeg is missing). "
-            "Run: pip install pydub  and make sure ffmpeg is on your PATH."
-        )
+        raise RuntimeError("edge-tts is not installed. Run: pip install edge-tts")
+    # pydub is deliberately NOT required here: the ffmpeg concat below is the
+    # real merge path, and pydub only backs it up. Demanding it up front made
+    # the whole app unusable on Python 3.13, where pydub can't import at all
+    # because the stdlib `audioop` module it needs was removed in PEP 594.
 
     chunks = split_into_word_chunks(text)
     if not chunks:
@@ -572,7 +318,7 @@ def generate_audio(text, out_folder, voice, rate, progress_cb=None,
     if on_merge_start:
         on_merge_start(len(part_paths))
 
-    final_path = os.path.join(out_folder, "book.mp3")
+    final_path = os.path.join(OUTPUT_FOLDER, "book.mp3")
     try:
         _merge_via_ffmpeg_concat(part_paths, final_path)
     except Exception:
@@ -591,192 +337,98 @@ def generate_audio(text, out_folder, voice, rate, progress_cb=None,
 
 
 # ----------------------------------------------------------------------------
-# Orchestration: the full crawl -> extract -> merge -> audio pipeline
+# Orchestration
 # ----------------------------------------------------------------------------
 
-def looks_like_blocked_page(html):
-    """Heuristic check for captcha / login-wall / verification pages."""
-    if not html:
-        return False
-    lowered = html.lower()
-    signals = [
-        "captcha", "are you a robot", "verify you are human",
-        "please sign in", "please log in", "access denied",
-        "cloudflare" in lowered and "checking your browser" in lowered,
-    ]
-    text_signals = [
-        "captcha" in lowered,
-        "are you a robot" in lowered,
-        "verify you are human" in lowered,
-        "please enable cookies and reload" in lowered,
-    ]
-    return any(text_signals)
+def _write_and_narrate(chapters, book_title, voice, rate):
+    """Shared tail of every job: book.txt, then book.mp3."""
+    update_state(download_base=build_download_base(chapters, book_title))
+    update_state(status="writing", message="Merging into book.txt...")
+
+    txt_path = os.path.join(OUTPUT_FOLDER, "book.txt")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(build_book_text(chapters))
+    update_state(txt_ready=True)
+
+    # Narration source drops the "PAGE n / URL / ===" markers so the reader
+    # doesn't say the separators out loud - just flowing content.
+    audio_source = "\n\n".join(ch["text"] for ch in chapters)
+
+    update_state(status="generating_audio",
+                 message="Generating audio (this can take a while)...")
+
+    def audio_progress(done, total):
+        update_state(audio_chunks_done=done, audio_chunks_total=total,
+                     message=f"Generating audio: chunk {done}/{total}")
+
+    def merge_start(n):
+        update_state(status="merging_audio",
+                     message=f"Merging {n} audio chunks into book.mp3...")
+
+    generate_audio(audio_source, OUTPUT_FOLDER, voice, rate,
+                   progress_cb=audio_progress, on_merge_start=merge_start)
+
+    update_state(status="done", running=False, mp3_ready=True,
+                 message="Done. book.txt and book.mp3 are ready.")
 
 
-def run_pipeline(start_url, max_pages, voice, rate):
+def run_pipeline(start_url, max_pages, voice, rate, source_name):
+    """Run the reader picked in /start, then narrate whatever it returns."""
     try:
-        chapters = []
-        current_url = start_url
-        visited = set()
-        page_num = 0
-        first_page_html = None
+        handler = sources.HANDLERS[source_name]
+        label = sources.SOURCE_LABELS.get(source_name, source_name)
+        update_state(source=source_name, message=f"Reading {label}...")
 
-        while current_url and page_num < max_pages:
-            if current_url in visited:
-                break
-            visited.add(current_url)
-            page_num += 1
+        def on_status(msg):
+            update_state(message=msg)
 
-            update_state(status="collecting", message=f"Fetching page {page_num}...")
+        result = handler(start_url, max_pages, on_status, append_page_log)
+        _write_and_narrate(result["chapters"], result["book_title"], voice, rate)
 
-            html, err = fetch_with_retry(current_url)
-
-            if html is None:
-                append_page_log({
-                    "page": page_num, "url": current_url, "title": None,
-                    "words": 0, "ok": False, "note": f"Failed: {err}",
-                })
-                update_state(status="error",
-                              message=f"Page {page_num} failed after retry: {err}",
-                              running=False, error=err)
-                return
-
-            if looks_like_blocked_page(html):
-                append_page_log({
-                    "page": page_num, "url": current_url, "title": None,
-                    "words": 0, "ok": False,
-                    "note": "Captcha / login / verification detected",
-                })
-                update_state(
-                    status="error", running=False,
-                    message="Manual intervention required (captcha, login, or "
-                             "verification page detected).",
-                    error="blocked_page",
-                )
-                return
-
-            if first_page_html is None:
-                first_page_html = html
-
-            title, raw_text = extract_article(html, current_url)
-            text = clean_text(raw_text)
-
-            if not text:
-                append_page_log({
-                    "page": page_num, "url": current_url, "title": title,
-                    "words": 0, "ok": False, "note": "Empty article, skipped",
-                })
-            else:
-                chapters.append({
-                    "page": page_num, "url": current_url,
-                    "title": title, "text": text,
-                    "chapter_num": extract_chapter_number(title, current_url),
-                })
-                append_page_log({
-                    "page": page_num, "url": current_url, "title": title,
-                    "words": len(text.split()), "ok": True, "note": "Complete",
-                })
-
-            update_state(message=f"Page {page_num} complete "
-                                  f"({len(chapters)} kept so far)")
-
-            next_url = find_next_link(html, current_url)
-            current_url = next_url
-
-        if not chapters:
-            update_state(status="error", running=False,
-                         message="No readable content was collected.",
-                         error="no_content")
-            return
-
-        book_title = extract_book_title(first_page_html, start_url) if first_page_html else urlparse(start_url).netloc
-        nums = [c["chapter_num"] for c in chapters if c.get("chapter_num") is not None]
-        chapter_range = f"{min(nums)}-{max(nums)}" if nums else f"{chapters[0]['page']}-{chapters[-1]['page']}"
-        update_state(download_base=sanitize_filename(f"{book_title} {chapter_range}"))
-
-        update_state(status="writing", message="Merging pages into book.txt...")
-        book_text = build_book_text(chapters)
-        txt_path = os.path.join(OUTPUT_FOLDER, "book.txt")
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(book_text)
-        update_state(txt_ready=True)
-
-        # Text used for audio: strip the "PAGE n / URL / ===" markers so
-        # narration doesn't read out separators, just keep flowing content.
-        audio_source = "\n\n".join(ch["text"] for ch in chapters)
-
-        update_state(status="generating_audio",
-                      message="Generating audio (this can take a while)...")
-
-        def audio_progress(done, total):
-            update_state(audio_chunks_done=done, audio_chunks_total=total,
-                          message=f"Generating audio: chunk {done}/{total}")
-
-        def merge_start(n):
-            update_state(status="merging_audio",
-                          message=f"Merging {n} audio chunks into book.mp3...")
-
-        generate_audio(audio_source, OUTPUT_FOLDER, voice, rate,
-                        progress_cb=audio_progress, on_merge_start=merge_start)
-
-        update_state(status="done", running=False,
-                      message="Done. book.txt and book.mp3 are ready.",
-                      mp3_ready=True)
-
+    except SourceError as e:
+        update_state(status="error", running=False, message=str(e), error=str(e))
     except Exception as e:
         traceback.print_exc()
         update_state(status="error", running=False,
-                      message=f"Unexpected error: {e}", error=str(e))
+                     message=f"Unexpected error: {e}", error=str(e))
 
 
 def run_pipeline_from_text(raw_text, source_name, voice, rate):
-    """
-    Same writing/audio stages as run_pipeline, but skips the crawl entirely -
-    used when the user uploads a .txt file directly instead of a URL.
-    """
+    """Uploaded .txt — skips fetching entirely, same narration tail."""
     try:
-        update_state(status="writing", message=f"Reading {source_name}...",
-                      download_base=sanitize_filename(os.path.splitext(source_name)[0]))
-
-        text = clean_text(raw_text)
-        if not text:
-            update_state(status="error", running=False,
-                          message="The uploaded file has no readable text.",
-                          error="empty_file")
-            return
-
-        append_page_log({
-            "page": 1, "url": source_name, "title": source_name,
-            "words": len(text.split()), "ok": True, "note": "Uploaded file",
-        })
-
-        txt_path = os.path.join(OUTPUT_FOLDER, "book.txt")
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(text)
-        update_state(txt_ready=True, message="book.txt written from upload.")
-
-        update_state(status="generating_audio",
-                      message="Generating audio (this can take a while)...")
-
-        def audio_progress(done, total):
-            update_state(audio_chunks_done=done, audio_chunks_total=total,
-                          message=f"Generating audio: chunk {done}/{total}")
-
-        def merge_start(n):
-            update_state(status="merging_audio",
-                          message=f"Merging {n} audio chunks into book.mp3...")
-
-        generate_audio(text, OUTPUT_FOLDER, voice, rate,
-                        progress_cb=audio_progress, on_merge_start=merge_start)
-
-        update_state(status="done", running=False,
-                      message="Done. book.txt and book.mp3 are ready.",
-                      mp3_ready=True)
-
+        update_state(source="upload", message=f"Reading {source_name}...")
+        result = sources.fetch_uploaded_text(raw_text, source_name,
+                                             append_page_log)
+        _write_and_narrate(result["chapters"], result["book_title"], voice, rate)
+    except SourceError as e:
+        update_state(status="error", running=False, message=str(e), error=str(e))
     except Exception as e:
         traceback.print_exc()
         update_state(status="error", running=False,
-                      message=f"Unexpected error: {e}", error=str(e))
+                     message=f"Unexpected error: {e}", error=str(e))
+
+
+# ----------------------------------------------------------------------------
+# Request helpers
+# ----------------------------------------------------------------------------
+
+def parse_rate(speed):
+    """0.5-2.0 multiplier -> the "+15%" / "-20%" string edge-tts expects."""
+    try:
+        speed = float(speed)
+    except (TypeError, ValueError):
+        speed = 1.0
+    speed = max(0.5, min(speed, 2.0))
+    pct = int(round((speed - 1.0) * 100))
+    return f"{'+' if pct >= 0 else ''}{pct}%"
+
+
+def clear_output_folder():
+    for f in glob.glob(os.path.join(OUTPUT_FOLDER, "*")):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
 
 
 # ----------------------------------------------------------------------------
@@ -786,55 +438,52 @@ def run_pipeline_from_text(raw_text, source_name, voice, rate):
 @app.route("/")
 def index():
     return render_template("index.html", voices=AVAILABLE_VOICES,
-                            max_pages_default=MAX_PAGES_DEFAULT,
-                            max_pages_hard_cap=MAX_PAGES_HARD_CAP,
-                            max_upload_size_mb=MAX_UPLOAD_SIZE_MB)
+                           max_pages_default=MAX_PAGES_DEFAULT,
+                           max_pages_hard_cap=MAX_PAGES_HARD_CAP,
+                           max_upload_size_mb=MAX_UPLOAD_SIZE_MB)
+
+
+@app.route("/detect")
+def detect():
+    """What would we do with this URL? Drives the live hint under the URL box."""
+    url = (request.args.get("url") or "").strip()
+    if not url:
+        return jsonify({"source": None, "label": None})
+    name = sources.route(url)
+    return jsonify({"source": name, "label": sources.SOURCE_LABELS.get(name)})
 
 
 @app.route("/start", methods=["POST"])
 def start():
     data = request.get_json(force=True, silent=True) or {}
     start_url = (data.get("url") or "").strip()
-    max_pages = data.get("max_pages", MAX_PAGES_DEFAULT)
-    voice = data.get("voice") or VOICE_DEFAULT
-    speed = data.get("speed", 1.0)
 
     if job_state["running"]:
         return jsonify({"ok": False, "error": "A job is already running."}), 409
 
     try:
-        max_pages = int(max_pages)
+        max_pages = int(data.get("max_pages", MAX_PAGES_DEFAULT))
     except (TypeError, ValueError):
         max_pages = MAX_PAGES_DEFAULT
     max_pages = max(1, min(max_pages, MAX_PAGES_HARD_CAP))
 
-    try:
-        speed = float(speed)
-    except (TypeError, ValueError):
-        speed = 1.0
-    speed = max(0.5, min(speed, 2.0))
-    pct = int(round((speed - 1.0) * 100))
-    rate = f"{'+' if pct >= 0 else ''}{pct}%"
+    voice = data.get("voice") or VOICE_DEFAULT
+    rate = parse_rate(data.get("speed", 1.0))
 
-    ok, err = validate_url(start_url)
+    ok, err, content_type = sources.validate_url(start_url)
     if not ok:
         return jsonify({"ok": False, "error": err}), 400
 
-    # clear old output files for a fresh run
-    for f in glob.glob(os.path.join(OUTPUT_FOLDER, "*")):
-        try:
-            os.remove(f)
-        except OSError:
-            pass
+    clear_output_folder()
+    source_name = sources.route(start_url, content_type)
+    reset_job_state(max_pages, source=source_name)
 
-    reset_job_state(max_pages)
+    threading.Thread(target=run_pipeline,
+                     args=(start_url, max_pages, voice, rate, source_name),
+                     daemon=True).start()
 
-    thread = threading.Thread(
-        target=run_pipeline, args=(start_url, max_pages, voice, rate), daemon=True
-    )
-    thread.start()
-
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "source": source_name,
+                    "label": sources.SOURCE_LABELS.get(source_name)})
 
 
 @app.route("/start_from_file", methods=["POST"])
@@ -867,29 +516,14 @@ def start_from_file():
             raw_text = raw_bytes.decode("latin-1", errors="ignore")
 
     voice = request.form.get("voice") or VOICE_DEFAULT
-    speed = request.form.get("speed", 1.0)
-    try:
-        speed = float(speed)
-    except (TypeError, ValueError):
-        speed = 1.0
-    speed = max(0.5, min(speed, 2.0))
-    pct = int(round((speed - 1.0) * 100))
-    rate = f"{'+' if pct >= 0 else ''}{pct}%"
+    rate = parse_rate(request.form.get("speed", 1.0))
 
-    # clear old output files for a fresh run
-    for f in glob.glob(os.path.join(OUTPUT_FOLDER, "*")):
-        try:
-            os.remove(f)
-        except OSError:
-            pass
+    clear_output_folder()
+    reset_job_state(max_pages=1, source="upload")
 
-    reset_job_state(max_pages=1)
-
-    thread = threading.Thread(
-        target=run_pipeline_from_text, args=(raw_text, filename, voice, rate),
-        daemon=True,
-    )
-    thread.start()
+    threading.Thread(target=run_pipeline_from_text,
+                     args=(raw_text, filename, voice, rate),
+                     daemon=True).start()
 
     return jsonify({"ok": True})
 
@@ -915,7 +549,7 @@ def download(kind):
     base = job_state.get("download_base")
     download_name = f"{base}.{kind}" if base else filename
     return send_from_directory(OUTPUT_FOLDER, filename, as_attachment=True,
-                                download_name=download_name)
+                               download_name=download_name)
 
 
 @app.errorhandler(413)
@@ -928,14 +562,17 @@ def handle_file_too_large(e):
 
 if __name__ == "__main__":
     missing = []
-    if trafilatura is None:
+    if sources.trafilatura is None:
         missing.append("trafilatura")
     if edge_tts is None:
         missing.append("edge-tts")
     if AudioSegment is None:
-        missing.append("pydub")
-    if sync_playwright is None:
-        missing.append("playwright (optional, improves JS-heavy page support)")
+        missing.append("pydub (optional - only the fallback audio merger; "
+                       "on Python 3.13+ also needs: pip install audioop-lts)")
+    if sources.feedparser is None:
+        missing.append("feedparser (needed for RSS/Atom feeds)")
+    if sources.sync_playwright is None:
+        missing.append("playwright (optional - Jina Reader covers JS pages)")
     if missing:
         print("NOTE: some optional/required packages are not installed:")
         for m in missing:

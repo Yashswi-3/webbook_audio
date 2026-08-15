@@ -5,6 +5,11 @@ beautifulsoup4
 trafilatura
 edge-tts
 pydub
-# playwright: omitted on purpose - the Dockerfile doesn't install Chromium,
-# so app.py's requests-based fallback handles crawling. Install locally if
-# you need JS-rendered pages.
+# pydub imports the stdlib `audioop`, removed in Python 3.13 (PEP 594).
+# Without this backport pydub can't import at all on 3.13+.
+audioop-lts; python_version >= "3.13"
+feedparser
+yt-dlp
+# playwright: omitted on purpose - the Dockerfile doesn't install Chromium.
+# On a Chromium-less deploy, JS-rendered pages are handled by the Jina Reader
+# rescue in sources.py instead. Install locally if you want local rendering.
