@@ -177,6 +177,45 @@ def test_validate_url_lets_refusals_through():
     assert sources._FATAL_STATUS == {404, 410}
 
 
+def test_url_shape_groups_siblings():
+    shape = sources._url_shape
+    a = shape("https://x.test/book/123/9001")
+    b = shape("https://x.test/book/123/9002")
+    assert a == b, "sibling chapters must share a shape"
+    assert shape("https://x.test/profile/7") != a
+    assert shape("https://other.test/book/123/9001") != a, "host is part of it"
+
+
+def test_parent_url():
+    p = sources._parent_url
+    assert p("https://x.test/book/123/9001") == "https://x.test/book/123"
+    assert p("https://x.test/book/123/") == "https://x.test/book"
+    assert p("https://x.test/book") is None
+    assert p("https://x.test/") is None
+
+
+def test_find_chapter_links_picks_the_biggest_group():
+    index = "https://x.test/book/123"
+    chrome = [
+        ("Home", "https://x.test/"),
+        ("Profile", "https://x.test/profile/7"),
+        ("Twitter", "https://twitter.test/someone"),      # offsite, ignored
+    ]
+    chapters = [(f"Chapter {n}", f"https://x.test/book/123/90{n:02d}")
+                for n in range(1, 11)]
+    links = chrome + chapters + [chapters[-1]]            # trailing dupe
+
+    found = sources.find_chapter_links(links, index)
+    assert [u for _l, u in found] == [u for _l, u in chapters], \
+        "document order, deduped, chrome excluded"
+
+    # A handful of siblings must NOT be mistaken for a chapter list: a chapter
+    # page's own nav has a few, and treating those as the book is worse than
+    # finding nothing.
+    few = chrome + chapters[:3]
+    assert sources.find_chapter_links(few, index) == []
+
+
 def test_bot_check_detection():
     # The exact wording yt-dlp emits, as seen on the Render deploy.
     assert sources.blocked_by_bot_check(

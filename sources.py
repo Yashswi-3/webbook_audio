@@ -457,7 +457,10 @@ _JINA_HEADER_RE = re.compile(
 )
 
 
-def jina_read(url):
+_MD_ANY_LINK_RE = re.compile(r"\[([^\]]*)\]\(([^)\s]+)\)")
+
+
+def jina_read(url, with_links=False):
     """
     Read any page through Jina Reader and return (title, markdown).
 
@@ -470,6 +473,11 @@ def jina_read(url):
     """
     url = normalize_public_url(url)
     headers = {"User-Agent": JINA_USER_AGENT, "Accept": "text/plain"}
+    if with_links:
+        # Appends a "Links/Buttons:" section listing every link on the page.
+        # Index pages need it: their chapter lists are rendered as controls
+        # that don't survive into the plain markdown body at all.
+        headers["X-With-Links-Summary"] = "true"
     if JINA_API_KEY:
         headers["Authorization"] = f"Bearer {JINA_API_KEY}"
 
@@ -1090,6 +1098,186 @@ def fetch_github(url, max_pages, on_status, on_page):
 
 
 # ----------------------------------------------------------------------------
+# Handler: chapter index / table of contents
+# ----------------------------------------------------------------------------
+# Chapter pages on serial-fiction sites often have no "next" link at all - the
+# navigation is JavaScript, and it survives neither a JS-less fetch nor Jina.
+# The table of contents does link every chapter, so read that instead and take
+# the chapters from it.
+
+_DIGIT_RUN_RE = re.compile(r"\d+")
+# A real chapter list is long. Requiring a big group stops a chapter page's
+# handful of sibling links from being mistaken for one - measured: a webnovel
+# chapter page's dominant shape has 3 links, its book page has 280.
+MIN_INDEX_LINKS = 8
+_INDEX_LABEL_RE = re.compile(
+    r"table of contents|catalog|contents|chapter list|all chapters|index",
+    re.IGNORECASE,
+)
+MAX_INDEX_HOPS = 2
+
+
+def _url_shape(url):
+    """Path with digit runs collapsed, so sibling chapter URLs share a shape."""
+    parsed = urlsplit(url)
+    return (parsed.netloc, _DIGIT_RUN_RE.sub("#", parsed.path))
+
+
+def _page_links(url):
+    """
+    [(label, absolute_url)] in document order, via direct fetch or the reader.
+    Returns (links, page_title).
+    """
+    html, _ = fetch_with_retry(url)
+    if html:
+        soup = BeautifulSoup(html, "html.parser")
+        title_tag = soup.find("title")
+        title = title_tag.get_text(strip=True) if title_tag else ""
+        links = [(a.get_text(" ", strip=True), a["href"])
+                 for a in soup.find_all("a", href=True)]
+    else:
+        title, _text, md = jina_read(url, with_links=True)
+        links = _MD_ANY_LINK_RE.findall(md)
+
+    out = []
+    for label, href in links:
+        if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+            continue
+        try:
+            absolute = normalize_public_url(urljoin(url, href))
+        except ValueError:
+            continue
+        out.append((label.strip(), absolute))
+    return out, title
+
+
+def find_chapter_links(links, index_url):
+    """
+    Pick the chapter list out of a page's links.
+
+    A table of contents is mostly one repeated link shape - every chapter has
+    the same URL pattern differing only in its numbers - surrounded by site
+    chrome that doesn't. So group by shape and take the biggest group, in
+    document order. No per-site rules.
+    """
+    host = urlsplit(index_url).netloc
+    groups = {}
+    for label, url in links:
+        if urlsplit(url).netloc != host:
+            continue                     # skip offsite chrome
+        if url.rstrip("/") == index_url.rstrip("/"):
+            continue
+        groups.setdefault(_url_shape(url), []).append((label, url))
+
+    if not groups:
+        return []
+
+    best = max(groups.values(), key=len)
+    if len(best) < MIN_INDEX_LINKS:
+        return []
+
+    seen, ordered = set(), []
+    for label, url in best:
+        if url not in seen:
+            seen.add(url)
+            ordered.append((label, url))
+    return ordered
+
+
+def _parent_url(url):
+    """One path segment up, or None at the root."""
+    parsed = urlsplit(url)
+    trimmed = parsed.path.rstrip("/").rsplit("/", 1)[0]
+    if not trimmed or trimmed == parsed.path.rstrip("/"):
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}{trimmed}"
+
+
+def discover_chapter_list(url, on_status):
+    """
+    Find the site's chapter list starting from whatever page the user pasted.
+
+    Looks at the page's own links first; if that page is a chapter rather than
+    an index, follows a link labelled like a table of contents and looks
+    again. Entirely label- and shape-driven, so it isn't tied to any one site.
+    Returns [(label, url)] in the order the site lists them.
+    """
+    seen_pages = set()
+    current = url
+
+    for _ in range(MAX_INDEX_HOPS):
+        if not current or current in seen_pages:
+            break
+        seen_pages.add(current)
+
+        try:
+            links, _title = _page_links(current)
+        except SourceError:
+            break
+
+        found = find_chapter_links(links, current)
+        if len(found) >= MIN_INDEX_LINKS:
+            return found
+
+        # Not an index page. Follow something that looks like one...
+        nxt = None
+        for label, href in links:
+            if _INDEX_LABEL_RE.search(label) or _INDEX_LABEL_RE.search(href):
+                nxt = href
+                break
+
+        # ...or failing that, walk up one path segment. A chapter usually
+        # lives under its book, and the book page is what lists the chapters.
+        if nxt is None:
+            nxt = _parent_url(current)
+
+        if nxt is None or nxt in seen_pages:
+            break
+        on_status("Looking for the chapter list...")
+        current = nxt
+
+    return []
+
+
+def read_chapter_urls(chapter_urls, start_page, max_count, on_status, on_page):
+    """Read a known list of chapter URLs. Shared by the crawl's index fallback."""
+    chapters = []
+    total = min(len(chapter_urls), max_count)
+
+    for offset, (label, chapter_url) in enumerate(chapter_urls[:max_count]):
+        check_cancelled()
+        page_num = start_page + offset
+        on_status(f"Chapter {offset + 1}/{total}: {label[:50]}")
+
+        html, err = fetch_with_retry(chapter_url)
+        if html:
+            title, raw = extract_article(html, chapter_url)
+        else:
+            try:
+                title, raw, _ = jina_read(chapter_url)
+            except SourceError as e:
+                on_page({"page": page_num, "url": chapter_url, "title": label,
+                         "words": 0, "ok": False, "note": f"Failed: {e}"})
+                continue
+
+        text = clean_text(raw)
+        if text:
+            chapters.append({
+                "page": page_num, "url": chapter_url, "title": title or label,
+                "text": text,
+                "chapter_num": extract_chapter_number(label or title, chapter_url),
+            })
+            on_page({"page": page_num, "url": chapter_url,
+                     "title": title or label, "words": len(text.split()),
+                     "ok": True, "note": "Complete"})
+        else:
+            on_page({"page": page_num, "url": chapter_url, "title": label,
+                     "words": 0, "ok": False, "note": "Empty chapter, skipped"})
+
+    return chapters
+
+
+# ----------------------------------------------------------------------------
 # Handler: generic web crawl  (the original v1 pipeline, now with Jina rescue)
 # ----------------------------------------------------------------------------
 
@@ -1207,6 +1395,39 @@ def fetch_crawl(url, max_pages, on_status, on_page):
             current_url = normalize_public_url(next_url) if next_url else None
         except ValueError:
             current_url = None          # a next-link pointing somewhere private
+
+    # The "next page" chain ran out early. Plenty of serial-fiction sites have
+    # no next link at all - the navigation is JavaScript, which survives
+    # neither a JS-less fetch nor the reader. Their index page does list every
+    # chapter, so go find it rather than returning 1 of the 50 asked for.
+    # Gate on the page looking like part of a series. A standalone article has
+    # no chapter number anywhere, and searching a site-wide index for one costs
+    # two reader round-trips that can only ever come back empty.
+    looks_serial = any(c.get("chapter_num") for c in chapters) or \
+        extract_chapter_number("", start_url) is not None
+
+    if (chapters and current_url is None and len(chapters) < max_pages
+            and looks_serial):
+        on_status("No next link. Looking for the site's chapter list...")
+        try:
+            listing = discover_chapter_list(start_url, on_status)
+        except (SourceError, ValueError):
+            listing = []
+
+        if len(listing) >= MIN_INDEX_LINKS:
+            # Start where the user pointed us, if that page is in the list.
+            already = {c["url"] for c in chapters}
+            start_at = next((i for i, (_l, u) in enumerate(listing)
+                             if u in already), None)
+            remaining = listing[start_at + 1:] if start_at is not None else listing
+            remaining = [(l, u) for l, u in remaining if u not in already]
+
+            if remaining:
+                on_status(f"Found {len(listing)} chapters in the index.")
+                chapters.extend(read_chapter_urls(
+                    remaining, len(chapters) + 1, max_pages - len(chapters),
+                    on_status, on_page))
+                used_reader_fallback = False   # the index path carried it
 
     if not chapters:
         raise SourceError("No readable content was collected.")
