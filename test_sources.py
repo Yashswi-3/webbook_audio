@@ -129,6 +129,18 @@ def test_ytdlp_progress_parsing():
         assert sources.parse_progress_percent(noise) is None
 
 
+def test_bot_check_detection():
+    # The exact wording yt-dlp emits, as seen on the Render deploy.
+    assert sources.blocked_by_bot_check(
+        "ERROR: [youtube] X: Sign in to confirm you're not a bot. "
+        "Use --cookies-from-browser or --cookies for the authentication.")
+    assert sources.blocked_by_bot_check("Use --cookies-from-browser")
+    assert not sources.blocked_by_bot_check(
+        "ERROR: [youtube] X: Video unavailable")
+    assert not sources.blocked_by_bot_check("[download] 100% of 34MiB")
+    assert not sources.blocked_by_bot_check("")
+
+
 def test_video_download_rejects_non_youtube_before_any_request():
     # Both checks happen before yt-dlp is invoked, so this stays offline.
     for bad in ["https://example.com/video", "http://127.0.0.1/v",

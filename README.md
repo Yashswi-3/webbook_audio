@@ -82,6 +82,20 @@ subtitle tracks but report "only images are available" for formats; the
 android client is the one that returns a real stream. Both are in `sources.py`
 as separate constants — changing one doesn't fix the other.
 
+### YouTube does not work on cloud hosting
+
+Both YouTube paths — MP4 download *and* captions — fail on Render, Fly,
+Railway, or any other cloud host, with "Sign in to confirm you're not a bot".
+
+The cause isn't the code. YouTube blocks datacenter IP ranges by default,
+because that's where scraping comes from. The identical request from a home
+connection is served normally. Nothing in this project can change that:
+getting past it requires account cookies, which this project doesn't use.
+
+So treat YouTube as a **local-only** feature. The web, RSS, GitHub and Jina
+readers are unaffected — they don't touch YouTube — so a deployed instance is
+still fully useful for everything else.
+
 ### Before you deploy this publicly
 
 Two things worth knowing:

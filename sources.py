@@ -104,6 +104,12 @@ YTDLP_SUB_LANGS = "en,en-US,en-GB,en-orig"
 # bot check, so 360p is the ceiling for anonymous downloads. Cookies would
 # lift it; this project deliberately doesn't do cookies.
 YTDLP_VIDEO_CLIENT = "android"
+# YouTube's bot-check refusal. It shows up constantly on cloud hosts, because
+# datacenter IP ranges are presumed to be scrapers, and almost never on a home
+# connection. Worth its own message: the raw yt-dlp text tells the user to pass
+# cookies, which is not something this app does or should suggest.
+_BOT_CHECK_SIGNS = ("sign in to confirm", "confirm you're not a bot",
+                    "confirm you are not a bot", "--cookies-from-browser")
 YTDLP_VIDEO_FORMAT = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 MAX_VIDEO_MB = 500             # guard against filling the disk on a long video
 _PROGRESS_RE = re.compile(r"\[download\]\s+([\d.]+)%")
@@ -637,6 +643,20 @@ def _run_ytdlp(args, timeout=YTDLP_TIMEOUT):
         raise SourceError("yt-dlp timed out fetching subtitles.") from e
 
 
+def blocked_by_bot_check(output):
+    """True if yt-dlp's output is YouTube's 'prove you're not a bot' refusal."""
+    lowered = (output or "").lower()
+    return any(sign in lowered for sign in _BOT_CHECK_SIGNS)
+
+
+_BOT_CHECK_MESSAGE = (
+    "YouTube refused this request with its bot check. That almost always "
+    "means this server is on a datacenter IP, which YouTube blocks by "
+    "default. The same link usually works from a home connection. Getting "
+    "past it needs account cookies, which this tool deliberately does not use."
+)
+
+
 def parse_progress_percent(line):
     """Pull the percentage out of a yt-dlp --newline progress line, else None."""
     m = _PROGRESS_RE.search(line or "")
@@ -708,12 +728,17 @@ def download_video(url, out_folder, on_status, on_percent=None):
         raise SourceError("Video download timed out.")
 
     if not os.path.exists(out_path):
-        detail = "\n".join(tail[-4:])
-        if "File is larger than max-filesize" in "\n".join(tail):
+        joined = "\n".join(tail)
+        if "File is larger than max-filesize" in joined:
             raise SourceError(
                 f"That video is larger than the {MAX_VIDEO_MB} MB limit."
             )
-        raise SourceError(f"Video download failed. {detail[-300:]}")
+        if blocked_by_bot_check(joined):
+            raise SourceError(_BOT_CHECK_MESSAGE)
+        # Last resort: show yt-dlp's own words, but only whole lines, so the
+        # message doesn't start mid-word the way a raw tail slice does.
+        detail = " ".join(ln for ln in tail[-3:] if ln.strip())
+        raise SourceError(f"Video download failed. {detail[:300]}")
 
     title = ""
     try:
@@ -768,9 +793,12 @@ def fetch_youtube(url, max_pages, on_status, on_page):
                 entries.append((vid, title or vid))
 
         if not entries:
+            combined = f"{result.stdout or ''}\n{result.stderr or ''}"
+            if blocked_by_bot_check(combined):
+                raise SourceError(_BOT_CHECK_MESSAGE)
             raise SourceError(
                 "yt-dlp returned no videos for that URL. "
-                f"{(result.stderr or '').strip()[-300:]}"
+                f"{combined.strip()[-300:]}"
             )
 
         chapters = []
