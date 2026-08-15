@@ -24,6 +24,7 @@ import asyncio
 import glob
 import os
 import subprocess
+import sys
 import threading
 import traceback
 from urllib.parse import urlparse
@@ -648,13 +649,18 @@ if __name__ == "__main__":
                        "on Python 3.13+ also needs: pip install audioop-lts)")
     if sources.feedparser is None:
         missing.append("feedparser (needed for RSS/Atom feeds)")
+    try:
+        import yt_dlp  # noqa: F401
+    except ImportError:
+        missing.append("yt-dlp (needed for YouTube captions AND MP4 download)")
     if sources.sync_playwright is None:
         missing.append("playwright (optional - Jina Reader covers JS pages)")
     if missing:
         print("NOTE: some optional/required packages are not installed:")
         for m in missing:
             print(f"  - {m}")
-        print("Install with: pip install -r requirements.txt")
+        print(f"Install into THIS interpreter: {sys.executable} -m pip "
+              "install -r requirements.txt")
         print("If using playwright, also run: playwright install chromium")
         print()
 
