@@ -96,6 +96,18 @@ YTDLP_PLAYER_CLIENTS = "web_safari,mweb,web_embedded"
 # auto-translated track (~40 of them) and get 429'd.
 YTDLP_SUB_LANGS = "en,en-US,en-GB,en-orig"
 
+# Video download (v2.5) uses a DIFFERENT client from captions. Measured
+# 2026-08-15: the caption clients above reach subtitle tracks but report
+# "only images are available" for formats; `android` is the one that returns
+# a real stream without any cookie. What it returns is format 18 - a single
+# combined 640x360 h264/aac file. The 720p+ adaptive streams sit behind the
+# bot check, so 360p is the ceiling for anonymous downloads. Cookies would
+# lift it; this project deliberately doesn't do cookies.
+YTDLP_VIDEO_CLIENT = "android"
+YTDLP_VIDEO_FORMAT = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+MAX_VIDEO_MB = 500             # guard against filling the disk on a long video
+_PROGRESS_RE = re.compile(r"\[download\]\s+([\d.]+)%")
+
 GITHUB_API = "https://api.github.com"
 
 
@@ -623,6 +635,99 @@ def _run_ytdlp(args, timeout=YTDLP_TIMEOUT):
         raise SourceError("yt-dlp is not installed. Run: pip install yt-dlp") from e
     except subprocess.TimeoutExpired as e:
         raise SourceError("yt-dlp timed out fetching subtitles.") from e
+
+
+def parse_progress_percent(line):
+    """Pull the percentage out of a yt-dlp --newline progress line, else None."""
+    m = _PROGRESS_RE.search(line or "")
+    if not m:
+        return None
+    try:
+        return max(0.0, min(float(m.group(1)), 100.0))
+    except ValueError:
+        return None
+
+
+def download_video(url, out_folder, on_status, on_percent=None):
+    """
+    Download a single YouTube video as MP4 into out_folder/video.mp4.
+    Returns the title, for naming the file the user gets.
+
+    Single video only - --no-playlist stops a pasted playlist link from
+    pulling down hundreds of files. Capped at MAX_VIDEO_MB.
+    """
+    url = normalize_public_url(url)
+    if not host_matches(url, "youtube.com", "youtu.be", "music.youtube.com"):
+        raise SourceError("Video download only supports YouTube links.")
+
+    out_path = os.path.join(out_folder, "video.mp4")
+    title_path = os.path.join(out_folder, ".video_title")
+    for stale in (out_path, title_path):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+
+    on_status("Starting video download...")
+    args = [
+        "--no-playlist",
+        "--extractor-args", f"youtube:player_client={YTDLP_VIDEO_CLIENT}",
+        "-f", YTDLP_VIDEO_FORMAT,
+        "--merge-output-format", "mp4",
+        "--max-filesize", f"{MAX_VIDEO_MB}M",
+        "--newline", "--no-warnings",
+        # Keep the title out of the progress stream so parsing stays simple.
+        "--print-to-file", "%(title)s", title_path,
+        "-o", os.path.join(out_folder, "video.%(ext)s"),
+        url,
+    ]
+
+    tail = []
+    try:
+        proc = subprocess.Popen([sys.executable, "-m", "yt_dlp", *args],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+    except FileNotFoundError as e:
+        raise SourceError("yt-dlp is not installed. Run: pip install yt-dlp") from e
+
+    try:
+        for line in proc.stdout:
+            line = line.rstrip()
+            tail.append(line)
+            del tail[:-25]
+            pct = parse_progress_percent(line)
+            if pct is not None:
+                if on_percent:
+                    on_percent(pct)
+                on_status(f"Downloading video: {pct:.0f}%")
+            elif line.startswith("[Merger]"):
+                on_status("Merging video and audio...")
+        proc.wait(timeout=YTDLP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        raise SourceError("Video download timed out.")
+
+    if not os.path.exists(out_path):
+        detail = "\n".join(tail[-4:])
+        if "File is larger than max-filesize" in "\n".join(tail):
+            raise SourceError(
+                f"That video is larger than the {MAX_VIDEO_MB} MB limit."
+            )
+        raise SourceError(f"Video download failed. {detail[-300:]}")
+
+    title = ""
+    try:
+        with open(title_path, encoding="utf-8", errors="replace") as f:
+            title = f.read().strip()
+    except OSError:
+        pass
+    finally:
+        try:
+            os.remove(title_path)
+        except OSError:
+            pass
+
+    return title or "video"
 
 
 def fetch_youtube(url, max_pages, on_status, on_page):

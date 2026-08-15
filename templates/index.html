@@ -211,6 +211,12 @@
     <input type="range" id="speed" min="0.75" max="1.5" step="0.25" value="1.0">
 
     <button id="startBtn">Start</button>
+    {% if allow_video %}
+    <button id="videoBtn" disabled>Download MP4 (YouTube only)</button>
+    <div class="field-hint">Single video, 360p max — higher resolutions sit behind
+      YouTube's bot check, which needs a login this tool doesn't do. Up to
+      {{ max_video_mb }} MB.</div>
+    {% endif %}
   </div>
 
   <div class="panel">
@@ -236,6 +242,9 @@
   <div class="panel downloads">
     <a href="/download/txt" id="downloadTxt" class="disabled">Download TXT</a>
     <a href="/download/mp3" id="downloadMp3" class="disabled">Download MP3</a>
+    {% if allow_video %}
+    <a href="/download/video" id="downloadVideo" class="disabled">Download MP4</a>
+    {% endif %}
   </div>
 
 <script>
@@ -252,6 +261,8 @@ const progressPercent = document.getElementById('progressPercent');
 const pageLog = document.getElementById('pageLog');
 const downloadTxt = document.getElementById('downloadTxt');
 const downloadMp3 = document.getElementById('downloadMp3');
+const downloadVideo = document.getElementById('downloadVideo');   // null if disabled
+const videoBtn = document.getElementById('videoBtn');             // null if disabled
 
 let pollTimer = null;
 
@@ -260,22 +271,57 @@ const urlInput = document.getElementById('url');
 const sourceHint = document.getElementById('sourceHint');
 const DEFAULT_HINT = sourceHint.textContent;
 let detectTimer = null;
+let lastDetected = null;
 
 urlInput.addEventListener('input', () => {
   clearTimeout(detectTimer);
   detectTimer = setTimeout(async () => {
     const url = urlInput.value.trim();
-    if (!url) { sourceHint.textContent = DEFAULT_HINT; return; }
+    if (!url) {
+      sourceHint.textContent = DEFAULT_HINT;
+      lastDetected = null;
+      if (videoBtn) videoBtn.disabled = true;
+      return;
+    }
     try {
       const res = await fetch('/detect?url=' + encodeURIComponent(url));
       const data = await res.json();
+      lastDetected = data.source;
       sourceHint.textContent = data.label ? 'Will read as: ' + data.label
                                           : DEFAULT_HINT;
     } catch (e) {
       sourceHint.textContent = DEFAULT_HINT;
+      lastDetected = null;
     }
+    // MP4 only makes sense for YouTube.
+    if (videoBtn) videoBtn.disabled = lastDetected !== 'youtube';
   }, 350);
 });
+
+if (videoBtn) {
+  videoBtn.addEventListener('click', async () => {
+    const url = urlInput.value.trim();
+    if (!url) { alert('Please enter a YouTube URL.'); return; }
+
+    beginJobUI();
+    videoBtn.disabled = true;
+
+    const res = await fetch('/start_video', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: url }),
+    });
+    const data = await res.json();
+
+    if (!data.ok) {
+      alert(data.error || 'Failed to start.');
+      endJobUIOnFailure();
+      videoBtn.disabled = false;
+      return;
+    }
+    beginPolling();
+  });
+}
 
 speedSlider.addEventListener('input', () => {
   speedValue.textContent = parseFloat(speedSlider.value).toFixed(2).replace(/0$/, '') + 'x';
@@ -284,9 +330,11 @@ speedSlider.addEventListener('input', () => {
 function beginJobUI() {
   startBtn.disabled = true;
   uploadBtn.disabled = true;
+  if (videoBtn) videoBtn.disabled = true;
   pageLog.innerHTML = '';
   downloadTxt.classList.add('disabled');
   downloadMp3.classList.add('disabled');
+  if (downloadVideo) downloadVideo.classList.add('disabled');
   progressFill.style.width = '0%';
   progressFill.className = 'progress-fill';
   progressPercent.textContent = '0%';
@@ -391,11 +439,13 @@ async function poll() {
 
   if (s.txt_ready) downloadTxt.classList.remove('disabled');
   if (s.mp3_ready) downloadMp3.classList.remove('disabled');
+  if (s.video_ready && downloadVideo) downloadVideo.classList.remove('disabled');
 
   if (!s.running) {
     clearInterval(pollTimer);
     startBtn.disabled = false;
     uploadBtn.disabled = false;
+    if (videoBtn) videoBtn.disabled = !lastDetected || lastDetected !== 'youtube';
   }
 }
 </script>

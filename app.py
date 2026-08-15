@@ -56,6 +56,12 @@ WORDS_PER_CHUNK = 3000
 MAX_CONCURRENT_TTS = 5             # how many edge-tts chunk requests run at once
 MAX_UPLOAD_SIZE_MB = 25            # cap on uploaded .txt file size
 
+# Video download (v2.5). On by default for local use. Set
+# ALLOW_VIDEO_DOWNLOAD=0 on a public deployment: serving MP4s to anyone who
+# finds the URL is bandwidth you pay for, and it's the kind of endpoint that
+# gets a host account terminated.
+ALLOW_VIDEO_DOWNLOAD = os.environ.get("ALLOW_VIDEO_DOWNLOAD", "1") != "0"
+
 AVAILABLE_VOICES = [
     "en-IN-NeerjaNeural",
     "en-IN-PrabhatNeural",
@@ -86,9 +92,11 @@ job_state = {
     "page_log": [],            # {"page", "url", "title", "words", "ok", "note"}
     "txt_ready": False,
     "mp3_ready": False,
+    "video_ready": False,
     "error": None,
     "audio_chunks_done": 0,
     "audio_chunks_total": 0,
+    "video_percent": 0,
     "download_base": None,     # e.g. "That Time an American 300-332"
 }
 
@@ -100,6 +108,7 @@ STAGE_PERCENT_RANGE = {
     "writing": (40, 45),
     "generating_audio": (45, 90),
     "merging_audio": (90, 98),
+    "downloading_video": (0, 98),
     "done": (100, 100),
     "error": (0, 0),
 }
@@ -118,6 +127,8 @@ def compute_percent(state):
         total = max(state.get("audio_chunks_total") or 1, 1)
         done = min(state.get("audio_chunks_done", 0), total)
         frac = done / total
+    elif status == "downloading_video":
+        frac = min(state.get("video_percent", 0), 100) / 100
     else:
         frac = 0
     return round(start + (end - start) * frac)
@@ -135,9 +146,11 @@ def reset_job_state(max_pages, source=None):
             "page_log": [],
             "txt_ready": False,
             "mp3_ready": False,
+            "video_ready": False,
             "error": None,
             "audio_chunks_done": 0,
             "audio_chunks_total": 0,
+            "video_percent": 0,
             "download_base": None,
         })
 
@@ -393,6 +406,35 @@ def run_pipeline(start_url, max_pages, voice, rate, source_name):
                      message=f"Unexpected error: {e}", error=str(e))
 
 
+def run_video_job(url):
+    """Download one YouTube video as MP4. No text, no narration."""
+    try:
+        update_state(status="downloading_video", source="video",
+                     message="Starting video download...")
+
+        def on_status(msg):
+            update_state(message=msg)
+
+        def on_percent(pct):
+            update_state(video_percent=pct)
+
+        title = sources.download_video(url, OUTPUT_FOLDER, on_status, on_percent)
+
+        append_page_log({"page": 1, "url": url, "title": title, "words": 0,
+                         "ok": True, "note": "MP4 downloaded"})
+        update_state(status="done", running=False, video_ready=True,
+                     video_percent=100,
+                     download_base=sources.sanitize_filename(title),
+                     message="Done. video.mp4 is ready.")
+
+    except SourceError as e:
+        update_state(status="error", running=False, message=str(e), error=str(e))
+    except Exception as e:
+        traceback.print_exc()
+        update_state(status="error", running=False,
+                     message=f"Unexpected error: {e}", error=str(e))
+
+
 def run_pipeline_from_text(raw_text, source_name, voice, rate):
     """Uploaded .txt — skips fetching entirely, same narration tail."""
     try:
@@ -440,7 +482,9 @@ def index():
     return render_template("index.html", voices=AVAILABLE_VOICES,
                            max_pages_default=MAX_PAGES_DEFAULT,
                            max_pages_hard_cap=MAX_PAGES_HARD_CAP,
-                           max_upload_size_mb=MAX_UPLOAD_SIZE_MB)
+                           max_upload_size_mb=MAX_UPLOAD_SIZE_MB,
+                           allow_video=ALLOW_VIDEO_DOWNLOAD,
+                           max_video_mb=sources.MAX_VIDEO_MB)
 
 
 @app.route("/detect")
@@ -528,6 +572,33 @@ def start_from_file():
     return jsonify({"ok": True})
 
 
+@app.route("/start_video", methods=["POST"])
+def start_video():
+    if not ALLOW_VIDEO_DOWNLOAD:
+        return jsonify({"ok": False,
+                        "error": "Video download is disabled on this server."}), 403
+
+    if job_state["running"]:
+        return jsonify({"ok": False, "error": "A job is already running."}), 409
+
+    data = request.get_json(force=True, silent=True) or {}
+    url = (data.get("url") or "").strip()
+
+    ok, err, _ = sources.validate_url(url)
+    if not ok:
+        return jsonify({"ok": False, "error": err}), 400
+
+    if sources.route(url) != "youtube":
+        return jsonify({"ok": False,
+                        "error": "Video download only supports YouTube links."}), 400
+
+    clear_output_folder()
+    reset_job_state(max_pages=1, source="video")
+
+    threading.Thread(target=run_video_job, args=(url,), daemon=True).start()
+    return jsonify({"ok": True})
+
+
 @app.route("/progress")
 def progress():
     return jsonify(get_state_snapshot())
@@ -539,6 +610,11 @@ def download(kind):
         filename = "book.txt"
     elif kind == "mp3":
         filename = "book.mp3"
+    elif kind == "video":
+        if not ALLOW_VIDEO_DOWNLOAD:
+            return jsonify({"ok": False,
+                            "error": "Video download is disabled."}), 403
+        filename = "video.mp4"
     else:
         return jsonify({"ok": False, "error": "Unknown file type"}), 404
 
@@ -547,7 +623,8 @@ def download(kind):
         return jsonify({"ok": False, "error": "File not ready yet"}), 404
 
     base = job_state.get("download_base")
-    download_name = f"{base}.{kind}" if base else filename
+    ext = "mp4" if kind == "video" else kind
+    download_name = f"{base}.{ext}" if base else filename
     return send_from_directory(OUTPUT_FOLDER, filename, as_attachment=True,
                                download_name=download_name)
 

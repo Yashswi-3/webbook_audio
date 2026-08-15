@@ -13,6 +13,9 @@ and reads it the right way:
 | A public GitHub repo | README, then `docs/*.md`, code blocks stripped | nothing |
 | A `.txt` file (upload) | Straight to audio | nothing |
 
+Plus one thing that isn't audio: a YouTube link can be downloaded as **MP4**
+instead of narrated — see *Video download* below.
+
 Built for content you have the right to access and convert for personal use.
 Nothing here bypasses a login, paywall, or CAPTCHA — see *Boundaries* below.
 
@@ -63,6 +66,36 @@ before v2 a JS-rendered page just came back empty there.
 Jina is free and needs no account. It rate-limits anonymous callers to roughly
 20 requests/minute — set `JINA_API_KEY` to lift that.
 
+## Video download
+
+Paste a YouTube URL and the **Download MP4** button lights up. One video, no
+playlists, capped at 500 MB.
+
+**It is 360p, and that is not a bug.** Format 18 — a single combined
+640x360 h264/aac stream — is the only real format YouTube serves to an
+anonymous caller. Every 720p+ adaptive stream sits behind the bot check, which
+wants cookies. This project doesn't do cookies, so 360p is the ceiling.
+
+Note this uses a *different* yt-dlp player client from the caption path
+(`android` vs `web_safari,mweb,web_embedded`). The caption clients reach
+subtitle tracks but report "only images are available" for formats; the
+android client is the one that returns a real stream. Both are in `sources.py`
+as separate constants — changing one doesn't fix the other.
+
+### Before you deploy this publicly
+
+Two things worth knowing:
+
+- YouTube's Terms of Service prohibit downloading without a download button.
+  Your own uploads, Creative Commons and public-domain videos are fine; most
+  other content isn't.
+- A public MP4 endpoint is bandwidth you pay for and an obvious target for
+  abuse. It's the kind of thing that gets a Render account terminated.
+
+So set `ALLOW_VIDEO_DOWNLOAD=0` on the deployed instance. That returns 403
+from both `/start_video` and `/download/video`, and drops the button and the
+download link from the page entirely. It defaults to on for local use.
+
 ## What came from Agent Reach, and what didn't
 
 Agent Reach routes 15 platforms. Only the ones that need **no login** and
@@ -84,6 +117,7 @@ Environment variables, all optional:
 |---|---|
 | `JINA_API_KEY` | Lifts Jina Reader's anonymous rate limit |
 | `GITHUB_TOKEN` | Lifts GitHub's 60 req/hr unauthenticated API limit |
+| `ALLOW_VIDEO_DOWNLOAD` | `0` disables MP4 download entirely. Default on. |
 
 Defaults live at the top of `app.py` and `sources.py`:
 
@@ -92,7 +126,9 @@ MAX_PAGES_DEFAULT = 25         # app.py
 MAX_PAGES_HARD_CAP = 100
 WORDS_PER_CHUNK = 3000
 MIN_ARTICLE_WORDS = 120        # sources.py - below this, Jina rescue fires
-YTDLP_PLAYER_CLIENTS = "web_safari,mweb,web_embedded"
+YTDLP_PLAYER_CLIENTS = "web_safari,mweb,web_embedded"   # captions
+YTDLP_VIDEO_CLIENT = "android"                          # mp4 download
+MAX_VIDEO_MB = 500
 ```
 
 `YTDLP_PLAYER_CLIENTS` is the knob to turn if YouTube captions start failing.

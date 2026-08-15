@@ -118,6 +118,28 @@ def test_antibot_detection():
     assert not sources._is_jina_antibot("Title: A normal article\nSome text\n")
 
 
+def test_ytdlp_progress_parsing():
+    assert sources.parse_progress_percent(
+        "[download]  89.1% of   34.84MiB at    5.05MiB/s ETA 00:00") == 89.1
+    assert sources.parse_progress_percent(
+        "[download] 100% of   34.84MiB in 00:00:05 at 6.84MiB/s") == 100.0
+    assert sources.parse_progress_percent("[download]   0.0% of ~1.00MiB") == 0.0
+    for noise in ["[Merger] Merging formats into \"video.mp4\"",
+                  "[youtube] aircAruvnKk: Downloading webpage", "", None]:
+        assert sources.parse_progress_percent(noise) is None
+
+
+def test_video_download_rejects_non_youtube_before_any_request():
+    # Both checks happen before yt-dlp is invoked, so this stays offline.
+    for bad in ["https://example.com/video", "http://127.0.0.1/v",
+                "https://youtube.com.evil.test/watch?v=1"]:
+        try:
+            sources.download_video(bad, "/tmp", lambda m: None)
+        except (sources.SourceError, ValueError):
+            continue
+        raise AssertionError(f"should have been rejected: {bad}")
+
+
 def test_clean_text_drops_nav_boilerplate():
     out = sources.clean_text("Home\n\nReal    sentence here.\nNext\nWe use cookies")
     assert out == "Real sentence here."
