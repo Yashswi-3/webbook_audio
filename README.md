@@ -189,4 +189,16 @@ VTT caption dedupe, and Markdown-to-speech stripping.
   `-w 1` for exactly this reason — a second worker would poll a job it can't
   see. Multi-user means real job storage first.
 - **No resume.** A crawl that dies at page 40 of 50 loses everything.
-- **No cancel.** Once started, a job runs to completion or error.
+
+## Reload and Stop
+
+The job lives on the server, not in the page. Refreshing, backgrounding the
+tab, or clearing the cache doesn't lose it — the page asks `/progress` on
+load and reconnects to whatever is running. A job that finished while you were
+away comes back with its download buttons already enabled.
+
+**Stop Job** appears while a job runs. Cancellation is cooperative: the flag
+is checked between pages and between audio chunks, and it kills yt-dlp
+outright, so a stop lands within a few seconds rather than instantly. Whatever
+already finished stays downloadable — stopping during narration still leaves
+you `book.txt`.

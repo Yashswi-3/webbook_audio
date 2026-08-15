@@ -121,6 +121,29 @@ class SourceError(Exception):
     """Anything that should stop the job and be shown to the user verbatim."""
 
 
+class JobCancelled(Exception):
+    """Raised at a loop boundary when the user has asked the job to stop."""
+
+
+# ponytail: module-level, safe only because the app runs one job at a time -
+# the same invariant gunicorn's `-w 1` already depends on. If this ever grows
+# concurrent jobs, this becomes per-job state and must move into the handler
+# signatures along with everything else in job_state.
+_cancel_check = None
+
+
+def set_cancel_check(fn):
+    """Install the predicate that check_cancelled() consults. None clears it."""
+    global _cancel_check
+    _cancel_check = fn
+
+
+def check_cancelled():
+    """Raise JobCancelled if the user pressed Stop. Call at loop boundaries."""
+    if _cancel_check is not None and _cancel_check():
+        raise JobCancelled("Stopped.")
+
+
 # ----------------------------------------------------------------------------
 # URL security
 # ----------------------------------------------------------------------------
@@ -738,6 +761,14 @@ def download_video(url, out_folder, on_status, on_percent=None):
 
     try:
         for line in proc.stdout:
+            # A half-downloaded file is worthless, so Stop kills yt-dlp
+            # outright rather than waiting for the transfer to finish.
+            try:
+                check_cancelled()
+            except JobCancelled:
+                proc.kill()
+                proc.wait(timeout=10)
+                raise
             line = line.rstrip()
             tail.append(line)
             del tail[:-25]
@@ -908,6 +939,7 @@ def fetch_rss(url, max_pages, on_status, on_page):
 
     chapters = []
     for i, entry in enumerate(entries, start=1):
+        check_cancelled()
         title = (getattr(entry, "title", "") or f"Entry {i}").strip()
         link = getattr(entry, "link", "") or url
         on_status(f"Feed entry {i}/{len(entries)}: {title[:60]}")
@@ -1036,6 +1068,7 @@ def fetch_github(url, max_pages, on_status, on_page):
 
     chapters = []
     for i, (title, api_path, preloaded) in enumerate(wanted[:max_pages], start=1):
+        check_cancelled()
         on_status(f"GitHub: {title} ({i}/{len(wanted[:max_pages])})")
         raw = preloaded if preloaded is not None else \
             _gh_decode(_gh_get(f"/repos/{owner}/{repo}/contents/{api_path}"))
@@ -1084,6 +1117,7 @@ def fetch_crawl(url, max_pages, on_status, on_page):
     book_title_override = None
 
     while current_url and page_num < max_pages:
+        check_cancelled()
         if current_url in visited:
             break
         visited.add(current_url)

@@ -231,6 +231,7 @@
     <div class="status-line">
       Status: <span class="status-badge" id="statusBadge">idle</span>
     </div>
+    <button id="stopBtn" style="display:none; background:#b3423f;">Stop Job</button>
     <div class="status-line" id="statusMessage" style="color: var(--muted);">Waiting to start.</div>
     <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
     <div class="progress-percent" id="progressPercent">0%</div>
@@ -263,6 +264,7 @@ const downloadTxt = document.getElementById('downloadTxt');
 const downloadMp3 = document.getElementById('downloadMp3');
 const downloadVideo = document.getElementById('downloadVideo');   // null if disabled
 const videoBtn = document.getElementById('videoBtn');             // null if disabled
+const stopBtn = document.getElementById('stopBtn');
 
 let pollTimer = null;
 
@@ -331,6 +333,8 @@ function beginJobUI() {
   startBtn.disabled = true;
   uploadBtn.disabled = true;
   if (videoBtn) videoBtn.disabled = true;
+  stopBtn.style.display = '';
+  stopBtn.disabled = false;
   pageLog.innerHTML = '';
   downloadTxt.classList.add('disabled');
   downloadMp3.classList.add('disabled');
@@ -415,18 +419,17 @@ uploadBtn.addEventListener('click', async () => {
   beginPolling();
 });
 
-async function poll() {
-  const res = await fetch('/progress');
-  const s = await res.json();
+function applyProgress(s) {
+  const bad = (s.status === 'error' || s.status === 'stopped');
 
   statusBadge.textContent = (s.status || '').replace(/_/g, ' ');
-  statusBadge.className = 'status-badge' + (s.status === 'done' ? ' done' : (s.status === 'error' ? ' error' : ''));
+  statusBadge.className = 'status-badge' + (s.status === 'done' ? ' done' : (bad ? ' error' : ''));
   statusMessage.textContent = s.message || '';
   pageCount.textContent = `Collected ${s.pages_done} / ${s.max_pages}`;
 
   const pct = typeof s.percent === 'number' ? s.percent : 0;
   progressFill.style.width = pct + '%';
-  progressFill.className = 'progress-fill' + (s.status === 'done' ? ' done' : (s.status === 'error' ? ' error' : ''));
+  progressFill.className = 'progress-fill' + (s.status === 'done' ? ' done' : (bad ? ' error' : ''));
   progressPercent.textContent = pct + '%';
 
   pageLog.innerHTML = '';
@@ -441,13 +444,50 @@ async function poll() {
   if (s.mp3_ready) downloadMp3.classList.remove('disabled');
   if (s.video_ready && downloadVideo) downloadVideo.classList.remove('disabled');
 
-  if (!s.running) {
+  if (s.running) {
+    startBtn.disabled = true;
+    uploadBtn.disabled = true;
+    if (videoBtn) videoBtn.disabled = true;
+    stopBtn.style.display = '';
+    stopBtn.disabled = !!s.cancel_requested;
+  } else {
     clearInterval(pollTimer);
+    pollTimer = null;
     startBtn.disabled = false;
     uploadBtn.disabled = false;
     if (videoBtn) videoBtn.disabled = !lastDetected || lastDetected !== 'youtube';
+    stopBtn.style.display = 'none';
+    stopBtn.disabled = false;
   }
 }
+
+async function poll() {
+  try {
+    applyProgress(await (await fetch('/progress')).json());
+  } catch (e) { /* transient network blip; the next tick retries */ }
+}
+
+stopBtn.addEventListener('click', async () => {
+  stopBtn.disabled = true;
+  statusMessage.textContent = 'Stopping...';
+  const res = await fetch('/stop', { method: 'POST' });
+  const data = await res.json();
+  if (!data.ok) { alert(data.error || 'Could not stop.'); stopBtn.disabled = false; }
+});
+
+// Reconnect after a reload. The job lives on the server, so a refresh, a
+// backgrounded tab, or a cleared cache doesn't lose it - and a job that
+// finished while the page was away still shows its download buttons.
+window.addEventListener('DOMContentLoaded', async () => {
+  stopBtn.style.display = 'none';
+  try {
+    const s = await (await fetch('/progress')).json();
+    if (s.status && s.status !== 'idle') {
+      applyProgress(s);
+      if (s.running && !pollTimer) beginPolling();
+    }
+  } catch (e) { /* nothing running, or offline - leave the idle UI alone */ }
+});
 </script>
 
 </body>

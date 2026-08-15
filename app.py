@@ -98,6 +98,7 @@ job_state = {
     "audio_chunks_done": 0,
     "audio_chunks_total": 0,
     "video_percent": 0,
+    "cancel_requested": False,
     "download_base": None,     # e.g. "That Time an American 300-332"
 }
 
@@ -112,6 +113,7 @@ STAGE_PERCENT_RANGE = {
     "downloading_video": (0, 98),
     "done": (100, 100),
     "error": (0, 0),
+    "stopped": (0, 0),
 }
 
 
@@ -152,8 +154,11 @@ def reset_job_state(max_pages, source=None):
             "audio_chunks_done": 0,
             "audio_chunks_total": 0,
             "video_percent": 0,
+            "cancel_requested": False,
             "download_base": None,
         })
+    # One job at a time, so a module-level hook in sources is enough.
+    sources.set_cancel_check(lambda: job_state["cancel_requested"])
 
 
 def update_state(**kwargs):
@@ -241,6 +246,9 @@ async def _generate_chunks_concurrently(chunks, out_folder, voice, rate,
         nonlocal completed
         part_path = os.path.join(out_folder, f"part{idx + 1}.mp3")
         async with semaphore:
+            # Checked inside the semaphore so queued chunks stop starting the
+            # moment Stop is pressed, instead of after the whole batch.
+            sources.check_cancelled()
             await _tts_chunk_to_file(chunk_text, part_path, voice, rate)
         part_paths[idx] = part_path
         if progress_cb:
@@ -399,12 +407,18 @@ def run_pipeline(start_url, max_pages, voice, rate, source_name):
         result = handler(start_url, max_pages, on_status, append_page_log)
         _write_and_narrate(result["chapters"], result["book_title"], voice, rate)
 
+    except sources.JobCancelled:
+        update_state(status="stopped", running=False,
+                     message="Stopped. Anything already finished is still "
+                             "downloadable below.")
     except SourceError as e:
         update_state(status="error", running=False, message=str(e), error=str(e))
     except Exception as e:
         traceback.print_exc()
         update_state(status="error", running=False,
                      message=f"Unexpected error: {e}", error=str(e))
+    finally:
+        sources.set_cancel_check(None)
 
 
 def run_video_job(url):
@@ -428,12 +442,18 @@ def run_video_job(url):
                      download_base=sources.sanitize_filename(title),
                      message="Done. video.mp4 is ready.")
 
+    except sources.JobCancelled:
+        update_state(status="stopped", running=False,
+                     message="Stopped. Anything already finished is still "
+                             "downloadable below.")
     except SourceError as e:
         update_state(status="error", running=False, message=str(e), error=str(e))
     except Exception as e:
         traceback.print_exc()
         update_state(status="error", running=False,
                      message=f"Unexpected error: {e}", error=str(e))
+    finally:
+        sources.set_cancel_check(None)
 
 
 def run_pipeline_from_text(raw_text, source_name, voice, rate):
@@ -443,12 +463,18 @@ def run_pipeline_from_text(raw_text, source_name, voice, rate):
         result = sources.fetch_uploaded_text(raw_text, source_name,
                                              append_page_log)
         _write_and_narrate(result["chapters"], result["book_title"], voice, rate)
+    except sources.JobCancelled:
+        update_state(status="stopped", running=False,
+                     message="Stopped. Anything already finished is still "
+                             "downloadable below.")
     except SourceError as e:
         update_state(status="error", running=False, message=str(e), error=str(e))
     except Exception as e:
         traceback.print_exc()
         update_state(status="error", running=False,
                      message=f"Unexpected error: {e}", error=str(e))
+    finally:
+        sources.set_cancel_check(None)
 
 
 # ----------------------------------------------------------------------------
@@ -596,6 +622,19 @@ def start_video():
     reset_job_state(max_pages=1, source="video")
 
     threading.Thread(target=run_video_job, args=(url,), daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/stop", methods=["POST"])
+def stop():
+    """
+    Ask the running job to stop. Cooperative: the flag is checked at loop
+    boundaries (between pages, between audio chunks) and kills yt-dlp
+    outright, so a stop lands within seconds rather than instantly.
+    """
+    if not job_state["running"]:
+        return jsonify({"ok": False, "error": "No job is running."}), 409
+    update_state(cancel_requested=True, message="Stopping...")
     return jsonify({"ok": True})
 
 
