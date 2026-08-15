@@ -99,6 +99,7 @@ job_state = {
     "audio_chunks_total": 0,
     "video_percent": 0,
     "cancel_requested": False,
+    "warning": None,           # job finished, but not the way you asked
     "download_base": None,     # e.g. "That Time an American 300-332"
 }
 
@@ -155,6 +156,7 @@ def reset_job_state(max_pages, source=None):
             "audio_chunks_total": 0,
             "video_percent": 0,
             "cancel_requested": False,
+            "warning": None,
             "download_base": None,
         })
     # One job at a time, so a module-level hook in sources is enough.
@@ -405,6 +407,8 @@ def run_pipeline(start_url, max_pages, voice, rate, source_name):
             update_state(message=msg)
 
         result = handler(start_url, max_pages, on_status, append_page_log)
+        if result.get("warning"):
+            update_state(warning=result["warning"])
         _write_and_narrate(result["chapters"], result["book_title"], voice, rate)
 
     except sources.JobCancelled:

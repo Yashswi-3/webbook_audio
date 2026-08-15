@@ -1115,6 +1115,7 @@ def fetch_crawl(url, max_pages, on_status, on_page):
     page_num = 0
     first_page_html = None
     book_title_override = None
+    used_reader_fallback = False
 
     while current_url and page_num < max_pages:
         check_cancelled()
@@ -1143,6 +1144,7 @@ def fetch_crawl(url, max_pages, on_status, on_page):
                     f"Reader: {jina_err}"
                 ) from None
 
+            used_reader_fallback = True
             text = clean_text(j_text)
             if text:
                 chapters.append({
@@ -1213,7 +1215,26 @@ def fetch_crawl(url, max_pages, on_status, on_page):
         book_title = extract_book_title(first_page_html, start_url)
     else:
         book_title = book_title_override or urlparse(start_url).netloc
-    return {"chapters": chapters, "book_title": book_title}
+
+    # Silently returning 1 chapter of the 50 that were asked for looks like a
+    # bug. Say which limit was hit instead.
+    warning = None
+    if used_reader_fallback and len(chapters) < max_pages:
+        warning = (
+            f"Stopped after {len(chapters)} of {max_pages} requested. This "
+            "server can't fetch that site directly, so pages came through the "
+            "reader, and the reader doesn't expose next-chapter links. "
+            "Running the app locally fetches the site directly and follows "
+            "the whole chain."
+        )
+    elif len(chapters) < max_pages and current_url is None:
+        warning = (
+            f"Stopped after {len(chapters)} of {max_pages} requested: no "
+            "\"next page\" link was found. Sites that paginate with a "
+            "JavaScript button instead of a real link can't be followed."
+        )
+
+    return {"chapters": chapters, "book_title": book_title, "warning": warning}
 
 
 # ----------------------------------------------------------------------------

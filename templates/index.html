@@ -233,6 +233,7 @@
     </div>
     <button id="stopBtn" style="display:none; background:#b3423f;">Stop Job</button>
     <div class="status-line" id="statusMessage" style="color: var(--muted);">Waiting to start.</div>
+    <div class="status-line" id="warningMessage" style="display:none; color:#e0a33e;"></div>
     <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
     <div class="progress-percent" id="progressPercent">0%</div>
     <div class="status-line" id="pageCount" style="color: var(--muted);"></div>
@@ -256,6 +257,7 @@ const speedSlider = document.getElementById('speed');
 const speedValue = document.getElementById('speedValue');
 const statusBadge = document.getElementById('statusBadge');
 const statusMessage = document.getElementById('statusMessage');
+const warningMessage = document.getElementById('warningMessage');
 const pageCount = document.getElementById('pageCount');
 const progressFill = document.getElementById('progressFill');
 const progressPercent = document.getElementById('progressPercent');
@@ -425,6 +427,8 @@ function applyProgress(s) {
   statusBadge.textContent = (s.status || '').replace(/_/g, ' ');
   statusBadge.className = 'status-badge' + (s.status === 'done' ? ' done' : (bad ? ' error' : ''));
   statusMessage.textContent = s.message || '';
+  warningMessage.textContent = s.warning || '';
+  warningMessage.style.display = s.warning ? '' : 'none';
   pageCount.textContent = `Collected ${s.pages_done} / ${s.max_pages}`;
 
   const pct = typeof s.percent === 'number' ? s.percent : 0;
