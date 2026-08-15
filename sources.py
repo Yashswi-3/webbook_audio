@@ -1177,6 +1177,36 @@ HANDLERS = {
     "rss": fetch_rss,
 }
 
+
+def resolve_source(url):
+    """
+    (source_name, error) for a pasted URL. Always applies the public-target
+    check; only probes the network when the answer would mean something.
+
+    The reachability probe is for the generic crawler, which fetches the
+    pasted URL directly. The other handlers don't: YouTube goes through
+    yt-dlp's InnerTube API, GitHub through api.github.com, RSS through
+    feedparser. Probing the page URL for those proves nothing about whether
+    the handler will work, and it actively vetoes URLs that would have worked
+    - youtube.com answers HEAD with 403 from datacenter IPs, so a cloud deploy
+    rejected every YouTube link with a misleading "URL returned HTTP 403"
+    before yt-dlp was ever given a chance.
+    """
+    try:
+        url = normalize_public_url(url)
+    except ValueError as e:
+        return None, str(e)
+
+    name = route(url)
+    if name != "web":
+        return name, None
+
+    ok, err, content_type = validate_url(url)
+    if not ok:
+        return None, err
+    # The probe's Content-Type can still reveal an unmarked feed.
+    return route(url, content_type), None
+
 SOURCE_LABELS = {
     "web": "web page / article chain",
     "youtube": "YouTube captions",

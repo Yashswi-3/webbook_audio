@@ -129,6 +129,35 @@ def test_ytdlp_progress_parsing():
         assert sources.parse_progress_percent(noise) is None
 
 
+def test_resolve_source_skips_network_probe_for_handler_sources():
+    """
+    YouTube/GitHub/RSS must resolve without any HTTP call. Regression test for
+    a cloud deploy rejecting every YouTube link with "URL returned HTTP 403",
+    because youtube.com 403s HEAD requests from datacenter IPs even though
+    yt-dlp (which uses a different API entirely) would have worked.
+    """
+    import sources as s
+    called = []
+    original = s.validate_url
+    s.validate_url = lambda u: (called.append(u), (True, None, ""))[1]
+    try:
+        assert s.resolve_source("https://www.youtube.com/watch?v=x") == ("youtube", None)
+        assert s.resolve_source("https://github.com/a/b") == ("github", None)
+        assert s.resolve_source("https://example.com/blog/feed") == ("rss", None)
+        assert called == [], f"probed the network for: {called}"
+
+        # The generic crawler still gets probed - it fetches the URL directly.
+        assert s.resolve_source("https://example.com/article") == ("web", None)
+        assert called == ["https://example.com/article"]
+    finally:
+        s.validate_url = original
+
+    # Security check still applies to every source.
+    for bad in ["http://127.0.0.1/x", "http://169.254.169.254/"]:
+        name, err = s.resolve_source(bad)
+        assert name is None and err
+
+
 def test_bot_check_detection():
     # The exact wording yt-dlp emits, as seen on the Render deploy.
     assert sources.blocked_by_bot_check(

@@ -515,12 +515,11 @@ def start():
     voice = data.get("voice") or VOICE_DEFAULT
     rate = parse_rate(data.get("speed", 1.0))
 
-    ok, err, content_type = sources.validate_url(start_url)
-    if not ok:
+    source_name, err = sources.resolve_source(start_url)
+    if err:
         return jsonify({"ok": False, "error": err}), 400
 
     clear_output_folder()
-    source_name = sources.route(start_url, content_type)
     reset_job_state(max_pages, source=source_name)
 
     threading.Thread(target=run_pipeline,
@@ -585,11 +584,11 @@ def start_video():
     data = request.get_json(force=True, silent=True) or {}
     url = (data.get("url") or "").strip()
 
-    ok, err, _ = sources.validate_url(url)
-    if not ok:
+    source_name, err = sources.resolve_source(url)
+    if err:
         return jsonify({"ok": False, "error": err}), 400
 
-    if sources.route(url) != "youtube":
+    if source_name != "youtube":
         return jsonify({"ok": False,
                         "error": "Video download only supports YouTube links."}), 400
 
