@@ -567,41 +567,118 @@ def extract_article(html, url, allow_jina=True):
 # Naming — real filenames instead of "book.mp3"
 # ----------------------------------------------------------------------------
 
-CHAPTER_WORD_RE = re.compile(r"^(chapter|ch\.?|episode|ep\.?|part)\s*#?\s*\d+",
-                             re.IGNORECASE)
-CHAPTER_NUM_RE = re.compile(r"chapter\s*#?\s*(\d+)", re.IGNORECASE)
-CHAPTER_NUM_URL_RE = re.compile(r"chapter[-_](\d+)", re.IGNORECASE)
+# Not anchored with ^ - a chapter marker in the middle of a title ("Muzan:
+# Conquering multiverse. Chapter 1 - Chapter 1: Michael Jackson. - WebNovel")
+# used to be invisible to the old ^-anchored version, so nothing ever got
+# truncated and the whole string became the "book title".
+CHAPTER_MARKER_RE = re.compile(
+    r"\b(?:chapter|ch\.?|episode|ep\.?|part)\s*#?\s*(\d+)", re.IGNORECASE)
+CHAPTER_NUM_URL_RE = re.compile(r"chapter[-_ ]?(\d+)", re.IGNORECASE)
+# fanfiction.net-style tail: "..., a loud house fanfic".
+_FANFIC_TAIL_RE = re.compile(r",\s*a\s+.+?\bfanfic\b\s*$", re.IGNORECASE)
+_BARE_NUM_SEGMENT_RE = re.compile(r"^\d{1,5}$")
+
+
+def _registrable_part(netloc):
+    """"www.webnovel.com" -> "webnovel" - what a title's trailing site-name
+    segment actually spells, stripped of the parts that never appear in it."""
+    host = (netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host.split(".")[0] if host else ""
+
+
+def _clean_raw_title(raw, netloc):
+    """
+    Clean one raw <title> string down to just the book name.
+
+    Order matters: drop the site-brand segment first (it can itself look
+    like a "chapter" candidate on some sites), then truncate everything from
+    the first chapter marker onward - that's usually where the per-chapter
+    subtitle and any remaining site name live, so it clears both at once.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+
+    raw = raw.split("|", 1)[0].strip()
+    segments = [s.strip() for s in raw.split(" - ") if s.strip()]
+    if len(segments) > 1:
+        site_key = _registrable_part(netloc)
+        last_alpha = re.sub(r"[^a-z]", "", segments[-1].lower())
+        if site_key and last_alpha == site_key:
+            segments = segments[:-1]
+    raw = " - ".join(segments) if segments else raw
+
+    m = CHAPTER_MARKER_RE.search(raw)
+    if m:
+        raw = raw[:m.start()]
+
+    raw = _FANFIC_TAIL_RE.sub("", raw)
+    return raw.strip(" \t\n-:,.–—")
+
+
+def extract_book_title_from_titles(raw_titles, fallback_url):
+    """
+    Book name from every chapter's raw <title>, cleaned by _clean_raw_title.
+
+    A single cleaned title is already reliable (that's the whole point of
+    truncating at the chapter marker), but the longest common prefix across
+    every page collected catches the sites where one page's non-chapter part
+    differs slightly from another's, and is site-agnostic - no per-site rule.
+    """
+    netloc = urlparse(fallback_url).netloc
+    cleaned = [c for c in (_clean_raw_title(t, netloc) for t in (raw_titles or [])) if c]
+    if not cleaned:
+        return netloc or fallback_url or "book"
+    if len(cleaned) == 1:
+        return cleaned[0]
+
+    prefix = os.path.commonprefix(cleaned)
+    # Only trim back if the prefix actually cuts a word in half - i.e. some
+    # cleaned title is longer than it and the very next character there
+    # isn't whitespace. Identical (or prefix-of) cleaned titles already end
+    # on a real word and must keep their last word.
+    cuts_mid_word = any(len(s) > len(prefix) and not s[len(prefix)].isspace()
+                        for s in cleaned)
+    if cuts_mid_word and prefix and not prefix[-1].isspace():
+        prefix = prefix.rsplit(" ", 1)[0] if " " in prefix else ""
+    prefix = prefix.strip(" \t\n-:,.")
+    return prefix if len(prefix) >= 3 else cleaned[0]
 
 
 def extract_book_title(html, fallback_url):
-    """
-    Page <title> tags are usually "Chapter Title - Book Title | Site Name"
-    (or the reverse). Drop the site name, then prefer whichever segment
-    doesn't look like a chapter label.
-    """
+    """Single-page convenience wrapper around extract_book_title_from_titles."""
+    raw = _raw_title_tag(html)
+    return extract_book_title_from_titles([raw] if raw else [], fallback_url)
+
+
+def _raw_title_tag(html):
+    """The page's raw <title> text, not the per-chapter title extract_article
+    finds inside the article body - that's a different string and the one
+    the book name has to come from."""
     soup = BeautifulSoup(html or "", "html.parser")
-    title_tag = soup.find("title")
-    raw = title_tag.get_text(strip=True) if title_tag else ""
-    raw = raw.split("|")[0].strip()
-
-    segments = [s.strip() for s in raw.split(" - ") if s.strip()]
-    candidates = [s for s in segments if not CHAPTER_WORD_RE.match(s)]
-    if candidates:
-        title = max(candidates, key=len)
-    elif segments:
-        title = segments[-1]
-    else:
-        title = urlparse(fallback_url).netloc
-
-    return title or urlparse(fallback_url).netloc
+    tag = soup.find("title")
+    return tag.get_text(strip=True) if tag else ""
 
 
 def extract_chapter_number(chapter_title, url):
-    """Best-effort chapter number from the page's own title, else the URL slug."""
-    m = CHAPTER_NUM_RE.search(chapter_title or "")
-    if not m:
-        m = CHAPTER_NUM_URL_RE.search(url or "")
-    return int(m.group(1)) if m else None
+    """
+    Best-effort chapter number: the page's own title, then the URL's
+    chapter-N token, then a bare numeric path segment of at most 5 digits -
+    fanfiction.net's /s/13857537/1/ has no other signal, and the 8-digit
+    story id right before it must not be mistaken for the chapter number.
+    """
+    m = CHAPTER_MARKER_RE.search(chapter_title or "")
+    if m:
+        return int(m.group(1))
+    m = CHAPTER_NUM_URL_RE.search(url or "")
+    if m:
+        return int(m.group(1))
+    segments = [s for s in urlsplit(url or "").path.split("/") if s]
+    if segments and _BARE_NUM_SEGMENT_RE.match(segments[-1]):
+        return int(segments[-1])
+    return None
 
 
 def sanitize_filename(name):
@@ -618,6 +695,54 @@ NEXT_TEXT_RE = re.compile(
     r"^\s*(next( page| chapter)?|continue( reading)?|»|›|>>|read more)\s*$",
     re.IGNORECASE,
 )
+
+
+_NEXT_GUESS_CHAPTER_RE = re.compile(r"(chapter[-_]?)(\d{1,5})$", re.IGNORECASE)
+
+
+def _too_thin_to_be_a_chapter(text):
+    """
+    Past the end of a book, a guessed URL still returns a page - it just
+    isn't a chapter. fanfiction.net answers a chapter number it doesn't have
+    with a 30-word "Chapter not found" notice, which is not empty and would
+    otherwise be narrated as the final chapter. A real chapter clears the
+    same floor the Jina rescue uses to decide a page came back thin.
+    """
+    return len((text or "").split()) < MIN_ARTICLE_WORDS
+
+
+def guess_next_numeric_url(url):
+    """
+    Last-resort next-page guess: increment the URL's trailing chapter number.
+
+    Only for fanfiction.net-style sites whose chapter nav is JS-only (a
+    <select> plus onclick buttons, no <a href> anywhere), so neither
+    find_next_link nor find_next_link_markdown can ever find anything. Only
+    touches a short numeric segment (<=5 digits) or an explicit chapter-N
+    token - never a long site-assigned id. webnovel's chapter URLs end in a
+    17-18 digit id; incrementing that would walk into nonsense, so a bare
+    numeric segment over 5 digits is left alone. Returns None when there's
+    nothing safe to increment.
+    """
+    parsed = urlsplit(url or "")
+    path = parsed.path
+    trailing_slash = path.endswith("/")
+    trimmed = path.rstrip("/")
+
+    m = _NEXT_GUESS_CHAPTER_RE.search(trimmed)
+    if m:
+        new_path = trimmed[:m.start(2)] + str(int(m.group(2)) + 1)
+    else:
+        segs = trimmed.split("/")
+        if not segs or not _BARE_NUM_SEGMENT_RE.match(segs[-1]):
+            return None
+        segs[-1] = str(int(segs[-1]) + 1)
+        new_path = "/".join(segs)
+
+    if trailing_slash:
+        new_path += "/"
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{parsed.scheme}://{parsed.netloc}{new_path}{query}"
 
 
 def find_next_link(html, current_url):
@@ -1127,6 +1252,27 @@ def _url_shape(url):
     return (parsed.netloc, _DIGIT_RUN_RE.sub("#", parsed.path))
 
 
+def _coarse_url_shape(url):
+    """
+    Second-pass shape: also collapses slug-like path segments to "*".
+
+    Sites that bake each chapter's own title into its URL never clear
+    MIN_INDEX_LINKS under _url_shape alone - measured on webnovel, 59 real
+    chapters land in 56 distinct fine shapes because the digit-run collapse
+    doesn't touch the slug text. Only reached as a fallback when the fine
+    pass comes up short, and only safe because the work-prefix guard already
+    scoped every candidate to one work before this ever runs.
+    """
+    parsed = urlsplit(url)
+    path = _DIGIT_RUN_RE.sub("#", parsed.path)
+    segs = [
+        "*" if seg not in ("", "#") and ("-" in seg or "_" in seg or len(seg) > 24)
+        else seg
+        for seg in path.split("/")
+    ]
+    return (parsed.netloc, "/".join(segs))
+
+
 def _page_links(url):
     """
     [(label, absolute_url)] in document order, via direct fetch or the reader.
@@ -1163,7 +1309,23 @@ def work_ids(url):
     return set(_WORK_ID_RE.findall(url or ""))
 
 
-def _belongs_to_work(url, ids, index_url):
+def _work_prefix(url):
+    """
+    The pasted URL minus its last path segment.
+
+    Site-agnostic and derived from the URL the user actually pasted, not
+    from whatever index page discovery ends up on - verified against
+    webnovel (/book/<bookslug>_<id>), freewebnovel (/novel/<slug>) and
+    fanfiction.net (/s/13857537): every chapter of the work starts with it,
+    no other novel does, and it works even when the URL has no numeric id at
+    all (the slug-only sites that broke the old id-only guard).
+    """
+    parsed = urlsplit(url)
+    trimmed = parsed.path.rstrip("/").rsplit("/", 1)[0]
+    return f"{parsed.scheme}://{parsed.netloc}{trimmed}"
+
+
+def _belongs_to_work(url, ids, index_url, work_prefix=None):
     """
     Is this link part of the same book as the page the user pasted?
 
@@ -1171,15 +1333,21 @@ def _belongs_to_work(url, ids, index_url):
     "recommended for you" carousel, and the crawler happily narrates the
     first chapter of fifteen unrelated novels. Every chapter of one book
     carries that book's id; every recommendation carries a different one.
+    The work-prefix test is the primary guard now - it still catches
+    cross-novel links on sites whose URLs carry no numeric id to compare.
     """
+    if work_prefix and not url.startswith(work_prefix):
+        return False
     if ids:
         return bool(ids & work_ids(url))
-    # No id to match on, so fall back to "lives under the index page".
+    if work_prefix:
+        return True
+    # No id and no prefix supplied, so fall back to "lives under the index page".
     index_path = urlsplit(index_url).path.rstrip("/")
     return urlsplit(url).path.startswith(index_path + "/") if index_path else False
 
 
-def find_chapter_links(links, index_url, ids=None):
+def find_chapter_links(links, index_url, ids=None, work_prefix=None):
     """
     Pick the chapter list out of a page's links.
 
@@ -1187,7 +1355,9 @@ def find_chapter_links(links, index_url, ids=None):
     the same URL pattern differing only in its numbers - surrounded by site
     chrome that doesn't. So group by shape and take the biggest group, in
     document order, after discarding anything belonging to a different work.
-    No per-site rules.
+    No per-site rules. When the fine-grained shape splits real siblings into
+    too many small groups (a chapter's own title slug baked into the URL),
+    a coarser second pass regroups slug-like segments together.
     """
     host = urlsplit(index_url).netloc
     if ids is None:
@@ -1199,7 +1369,7 @@ def find_chapter_links(links, index_url, ids=None):
             continue                     # skip offsite chrome
         if url.rstrip("/") == index_url.rstrip("/"):
             continue
-        if not _belongs_to_work(url, ids, index_url):
+        if not _belongs_to_work(url, ids, index_url, work_prefix):
             continue
         groups.setdefault(_url_shape(url), []).append((label, url))
 
@@ -1208,7 +1378,14 @@ def find_chapter_links(links, index_url, ids=None):
 
     best = max(groups.values(), key=len)
     if len(best) < MIN_INDEX_LINKS:
-        return []
+        coarse_groups = {}
+        for label, url in [item for grp in groups.values() for item in grp]:
+            coarse_groups.setdefault(_coarse_url_shape(url), []).append((label, url))
+        coarse_best = max(coarse_groups.values(), key=len) if coarse_groups else []
+        if len(coarse_best) >= MIN_INDEX_LINKS:
+            best = coarse_best
+        else:
+            return []
 
     seen, ordered = set(), []
     for label, url in best:
@@ -1252,6 +1429,7 @@ def discover_chapter_list(url, on_status):
     # Taken from the URL the user pasted, so hopping to the book page can't
     # drift onto a different book's links.
     ids = work_ids(url)
+    work_prefix = _work_prefix(url)
 
     seen = set()
     queue = [url]
@@ -1268,7 +1446,7 @@ def discover_chapter_list(url, on_status):
         except SourceError:
             links = []
 
-        found = find_chapter_links(links, current, ids)
+        found = find_chapter_links(links, current, ids, work_prefix)
         if len(found) >= MIN_INDEX_LINKS:
             return found
 
@@ -1278,20 +1456,24 @@ def discover_chapter_list(url, on_status):
                 queue.append(href)
 
         # ...the page one segment up, since a chapter lives under its book and
-        # the book page is what lists the chapters. Only while the id is still
-        # in the path: above that we've left the work behind and would just be
-        # reading the site's front page.
+        # the book page is what lists the chapters. Never climb above the
+        # work root - "no id" used to mean "always climb", which is how a
+        # slug-only chapter page (no 6+ digit id anywhere in the URL) walked
+        # all the way to the site's front-page listing and admitted every
+        # novel on it. work_prefix's own guess-path fallback below covers
+        # that case instead.
         parent = _parent_url(current)
-        if parent and (not ids or ids & work_ids(parent)):
+        if parent and ids and ids & work_ids(parent):
             queue.append(parent)
 
         # ...and, once everything else is exhausted, the conventional index
-        # paths under the work's own URL. Some sites render their contents
-        # link with JavaScript, so it never reaches us to be followed.
+        # paths under the work's own URL (the pasted URL minus its last
+        # segment - reliable even with no numeric id to anchor on). Some
+        # sites render their contents link with JavaScript, so it never
+        # reaches us to be followed.
         if not queue and not guessed:
             guessed = True
-            base = _work_root(url, ids)
-            queue.extend(f"{base.rstrip('/')}/{seg}" for seg in INDEX_PATH_GUESSES)
+            queue.extend(f"{work_prefix.rstrip('/')}/{seg}" for seg in INDEX_PATH_GUESSES)
             on_status("Looking for the chapter list...")
 
     return []
@@ -1359,9 +1541,12 @@ def fetch_crawl(url, max_pages, on_status, on_page):
     chapters = []
     visited = set()
     page_num = 0
-    first_page_html = None
-    book_title_override = None
+    raw_titles = []             # every page's raw <title>, for the book name
     used_reader_fallback = False
+    index_total = None          # set once the chapter-index fallback finds one
+    next_is_guess = False       # the upcoming current_url came from a numeric guess
+    prev_title = None           # to detect a guessed page that repeats the last one
+    ran_past_last_chapter = False   # a guess landed past the end of the book
 
     while current_url and page_num < max_pages:
         check_cancelled()
@@ -1369,6 +1554,8 @@ def fetch_crawl(url, max_pages, on_status, on_page):
             break
         visited.add(current_url)
         page_num += 1
+        is_guess = next_is_guess
+        next_is_guess = False
 
         on_status(f"Fetching page {page_num}...")
         html, err = fetch_with_retry(current_url)
@@ -1381,7 +1568,10 @@ def fetch_crawl(url, max_pages, on_status, on_page):
             on_status(f"Page {page_num} refused the direct fetch, "
                       "trying the reader...")
             try:
-                j_title, j_text, j_md = jina_read(current_url)
+                # with_links=True: without it the markdown carries no links at
+                # all, so find_next_link_markdown could never match anything -
+                # every reader-only crawl silently stopped after one page.
+                j_title, j_text, j_md = jina_read(current_url, with_links=True)
             except SourceError as jina_err:
                 on_page({"page": page_num, "url": current_url, "title": None,
                          "words": 0, "ok": False, "note": f"Failed: {err}"})
@@ -1392,6 +1582,20 @@ def fetch_crawl(url, max_pages, on_status, on_page):
 
             used_reader_fallback = True
             text = clean_text(j_text)
+
+            if is_guess and (_too_thin_to_be_a_chapter(text)
+                             or (prev_title and j_title == prev_title)):
+                # The numeric guess landed on a page with nothing new to say -
+                # fanfiction.net's /s/13857537/3/ comes back as a 30-word
+                # "Chapter not found" notice. That's the end of the book, not
+                # a real page; stop here instead of burning the rest of the
+                # page budget and narrating the notice as a chapter.
+                on_page({"page": page_num, "url": current_url, "title": j_title,
+                         "words": 0, "ok": False,
+                         "note": "Guessed next-chapter URL led nowhere, stopping"})
+                ran_past_last_chapter = True
+                break
+
             if text:
                 chapters.append({
                     "page": page_num, "url": current_url,
@@ -1406,10 +1610,20 @@ def fetch_crawl(url, max_pages, on_status, on_page):
                 on_page({"page": page_num, "url": current_url, "title": j_title,
                          "words": 0, "ok": False, "note": "Empty article, skipped"})
 
-            if first_page_html is None and j_title:
-                book_title_override = j_title
+            if j_title:
+                raw_titles.append(j_title)
+                prev_title = j_title
 
             next_url = find_next_link_markdown(j_md, current_url)
+            if not next_url:
+                # Reader-only sites like fanfiction.net put chapter nav in a
+                # <select> plus JS onclick buttons - there is no <a href> to
+                # another chapter anywhere on the page, so this is the only
+                # way to keep the chain going.
+                guess = guess_next_numeric_url(current_url)
+                if guess and guess not in visited:
+                    next_url = guess
+                    next_is_guess = True
             try:
                 current_url = normalize_public_url(next_url) if next_url else None
             except ValueError:
@@ -1430,11 +1644,22 @@ def fetch_crawl(url, max_pages, on_status, on_page):
                 "page detected)."
             )
 
-        if first_page_html is None:
-            first_page_html = html
+        raw_titles.append(_raw_title_tag(html))
 
         title, raw_text = extract_article(html, current_url)
         text = clean_text(raw_text)
+
+        if is_guess and (_too_thin_to_be_a_chapter(text)
+                         or (prev_title and title == prev_title)):
+            # Same reasoning as the reader-path guard above: a guessed URL
+            # that comes back thin or repeats the previous page's title
+            # means the chain has run out, not that the page is a dud worth
+            # skipping and continuing past.
+            on_page({"page": page_num, "url": current_url, "title": title,
+                     "words": 0, "ok": False,
+                     "note": "Guessed next-chapter URL led nowhere, stopping"})
+            ran_past_last_chapter = True
+            break
 
         if not text:
             on_page({"page": page_num, "url": current_url, "title": title,
@@ -1445,10 +1670,16 @@ def fetch_crawl(url, max_pages, on_status, on_page):
                              "chapter_num": extract_chapter_number(title, current_url)})
             on_page({"page": page_num, "url": current_url, "title": title,
                      "words": len(text.split()), "ok": True, "note": "Complete"})
+        prev_title = title or prev_title
 
         on_status(f"Page {page_num} complete ({len(chapters)} kept so far)")
 
         next_url = find_next_link(html, current_url)
+        if not next_url:
+            guess = guess_next_numeric_url(current_url)
+            if guess and guess not in visited:
+                next_url = guess
+                next_is_guess = True
         try:
             current_url = normalize_public_url(next_url) if next_url else None
         except ValueError:
@@ -1480,6 +1711,12 @@ def fetch_crawl(url, max_pages, on_status, on_page):
             remaining = listing[start_at + 1:] if start_at is not None else listing
             remaining = [(l, u) for l, u in remaining if u not in already]
 
+            # Only "that's the whole book" if the index really did run out
+            # first. Coming up short because chapters failed to read is a
+            # different thing and must not be reported as a complete book.
+            if len(remaining) <= max_pages - len(chapters):
+                index_total = len(listing)
+
             if remaining:
                 on_status(f"Found {len(listing)} chapters in the index.")
                 chapters.extend(read_chapter_urls(
@@ -1490,21 +1727,36 @@ def fetch_crawl(url, max_pages, on_status, on_page):
     if not chapters:
         raise SourceError("No readable content was collected.")
 
-    if first_page_html is not None:
-        book_title = extract_book_title(first_page_html, start_url)
-    else:
-        book_title = book_title_override or urlparse(start_url).netloc
+    book_title = extract_book_title_from_titles(raw_titles, start_url)
 
     # Silently returning 1 chapter of the 50 that were asked for looks like a
     # bug. Say which limit was hit instead.
     warning = None
-    if used_reader_fallback and len(chapters) < max_pages:
+    if ran_past_last_chapter and len(chapters) < max_pages:
+        # First, because the reader message below would otherwise blame the
+        # reader for a chain that was in fact followed all the way to the
+        # end of the book.
+        warning = (
+            f"Reached the end: {len(chapters)} chapters is everything this "
+            f"book has, rather than the {max_pages} requested."
+        )
+    elif used_reader_fallback and len(chapters) < max_pages:
         warning = (
             f"Stopped after {len(chapters)} of {max_pages} requested. This "
             "server can't fetch that site directly, so pages came through the "
             "reader, and the reader doesn't expose next-chapter links. "
             "Running the app locally fetches the site directly and follows "
             "the whole chain."
+        )
+    elif index_total is not None and len(chapters) < max_pages:
+        # The index list was found and read to the end - this book simply has
+        # fewer chapters than were asked for. Say so instead of "no next page
+        # link was found", which reads like a failure when it isn't one.
+        warning = (
+            f"Reached the end of the book: the index lists {index_total} "
+            f"chapters, every one was tried, and {len(chapters)} came back "
+            f"readable - so {len(chapters)} rather than the {max_pages} "
+            "requested."
         )
     elif len(chapters) < max_pages and current_url is None:
         warning = (

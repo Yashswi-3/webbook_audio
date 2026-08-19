@@ -278,6 +278,176 @@ def test_clean_text_drops_nav_boilerplate():
     assert out == "Real sentence here."
 
 
+# ----------------------------------------------------------------------------
+# Bug 1 - download filenames were garbage
+# ----------------------------------------------------------------------------
+
+def test_extract_book_title_strips_site_brand_and_chapter_marker():
+    # Real <title> tags captured from webnovel and fanfiction.net. The old
+    # code only split the site brand off on "|" (so "- WebNovel" survived),
+    # anchored its chapter-word check with ^ (so a mid-string "Chapter 1"
+    # wasn't recognised), then picked the longest segment - producing the
+    # whole raw title as the "book name" in both cases.
+    html = ("<title>Muzan: Conquering multiverse. Chapter 1 - Chapter 1: "
+            "Michael Jackson. - WebNovel</title>")
+    got = sources.extract_book_title(html, "https://www.webnovel.com/book/x/y")
+    assert got == "Muzan: Conquering multiverse"
+    assert sources.sanitize_filename(f"{got} 1-19") == "Muzan Conquering multiverse 1-19"
+
+    html2 = ("<title>Tales From Camp Lakewood Chapter 1: School's Out!, "
+             "a loud house fanfic</title>")
+    got2 = sources.extract_book_title(html2, "https://www.fanfiction.net/s/13857537/1/")
+    assert got2 == "Tales From Camp Lakewood"
+    assert sources.sanitize_filename(f"{got2} 1-44") == "Tales From Camp Lakewood 1-44"
+
+
+def test_extract_book_title_from_titles_prefers_common_prefix():
+    # fetch_crawl now collects every page's raw <title>, not just the first -
+    # the longest common prefix across all of them (after per-title cleaning)
+    # is the reliable, site-agnostic signal for the book name.
+    titles = [
+        "Muzan: Conquering multiverse. Chapter 1 - Chapter 1: Michael Jackson. - WebNovel",
+        "Muzan: Conquering multiverse. Chapter 2 - Chapter 2: Assigning Tasks. - WebNovel",
+        "Muzan: Conquering multiverse. Chapter 3 - Chapter 3: Entertainment District. - WebNovel",
+    ]
+    got = sources.extract_book_title_from_titles(
+        titles, "https://www.webnovel.com/book/muzan-conquering-multiverse._x/y")
+    assert got == "Muzan: Conquering multiverse"
+
+    # A single collected title still works (non-serial pages, or a crawl that
+    # only ever got one page).
+    assert sources.extract_book_title_from_titles(
+        ["Tales From Camp Lakewood Chapter 1: School's Out!, a loud house fanfic"],
+        "https://www.fanfiction.net/s/13857537/1/") == "Tales From Camp Lakewood"
+
+    # No titles at all: fall back to the netloc, never crash.
+    assert sources.extract_book_title_from_titles(
+        [], "https://example.com/a") == "example.com"
+
+
+def test_extract_chapter_number_tries_title_then_url_then_bare_segment():
+    # Title match, any of the recognised words.
+    assert sources.extract_chapter_number("Chapter 12: Battle", "https://x.test/a") == 12
+    assert sources.extract_chapter_number("Episode 4", "https://x.test/a") == 4
+    assert sources.extract_chapter_number("Part #7", "https://x.test/a") == 7
+
+    # No title match: fall back to a chapter-N token in the URL.
+    assert sources.extract_chapter_number("", "https://x.test/book/chapter-9") == 9
+
+    # No title, no URL token: a bare numeric path segment of at most 5
+    # digits - this is what makes fanfiction.net's /s/13857537/1/ yield 1.
+    assert sources.extract_chapter_number("", "https://www.fanfiction.net/s/13857537/1/") == 1
+
+    # The 8-digit story id must never be mistaken for the chapter number.
+    assert sources.extract_chapter_number("", "https://www.fanfiction.net/s/13857537/") is None
+    assert sources.extract_chapter_number(
+        "", "https://www.webnovel.com/book/x/97088154485448446") is None
+
+
+# ----------------------------------------------------------------------------
+# Bug 2 - chapter-index fallback never fired on slug-heavy sites, and mixed
+# up novels on id-only sites
+# ----------------------------------------------------------------------------
+
+# 10 real chapter URLs from webnovel's /catalog page for "Muzan: Conquering
+# multiverse" (site-relative, as captured), plus 2 synthetic URLs for a
+# different book in the same URL shape, to prove cross-novel rejection.
+_WEBNOVEL_BOOK = "https://www.webnovel.com/book/muzan-conquering-multiverse._36163297308457405"
+_WEBNOVEL_CHAPTER_PATHS = [
+    "/chapter-1-michael-jackson._97088154485448446",
+    "/chapter-2-assigning-tasks._97103132378587911",
+    "/chapter-3-entertainment-district._97125659079403012",
+    "/chapter-4-hashiras-arrive._97131854301290125",
+    "/chapter-5-final-boss-appears._97142982158898403",
+    "/chapter-6-immune-to-sun._97156987107732416",
+    "/chapter-7-nezuko-cured-reluctant-akaza-otherworld._97171119697613874",
+    "/chapter-8-nakime!-close-that-fcking-door!._97172264977486661",
+    "/chapter-9-danmachi._97198733116103153",
+    "/chapter-10-gather-six-divinities._97210017874238150",
+]
+_OTHER_BOOK = "https://www.webnovel.com/book/some-other-novel._24681357924681357"
+_OTHER_BOOK_PATHS = [
+    "/chapter-1-first._13579246813579246",
+    "/chapter-2-second._13579246813579247",
+]
+
+
+def test_find_chapter_links_coarsens_slug_heavy_urls():
+    # Regression: each chapter's own title slug is baked into its URL, so
+    # digit-run collapse alone spreads 10+ real chapters across as many
+    # distinct shapes - none near MIN_INDEX_LINKS. The coarse second pass
+    # (slug segments -> "*") must still find them once the work-prefix guard
+    # has scoped candidates to one work.
+    chapter_urls = [_WEBNOVEL_BOOK + p for p in _WEBNOVEL_CHAPTER_PATHS]
+    other_urls = [_OTHER_BOOK + p for p in _OTHER_BOOK_PATHS]
+    links = ([("Home", "https://www.webnovel.com/")]
+             + [(f"Chapter {i+1}", u) for i, u in enumerate(chapter_urls)]
+             + [("Some Other Novel", u) for u in other_urls])
+
+    fine_shapes = {sources._url_shape(u) for u in chapter_urls}
+    assert len(fine_shapes) > 1, "fixture should reproduce the fine-shape split"
+
+    index_url = _WEBNOVEL_BOOK + "/catalog"
+    pasted_url = chapter_urls[0]          # what the user actually pasted
+    ids = sources.work_ids(pasted_url)
+    work_prefix = sources._work_prefix(pasted_url)
+
+    found = sources.find_chapter_links(links, index_url, ids, work_prefix)
+    assert [u for _l, u in found] == chapter_urls
+    for _l, u in found:
+        assert "some-other-novel" not in u
+
+
+def test_work_prefix_scopes_slug_only_sites_with_no_numeric_id():
+    # freewebnovel-style URLs carry no 6+ digit id anywhere, so the old
+    # id-only guard (`ids` empty) fell back to "lives under the index page",
+    # which admits every novel listed on a site-wide index. The work-prefix
+    # guard (pasted URL minus its last segment) catches this with no id at all.
+    pasted = "https://freewebnovel.test/novel/some-great-story/chapter-5"
+    prefix = sources._work_prefix(pasted)
+    assert prefix == "https://freewebnovel.test/novel/some-great-story"
+
+    same_work = [(f"Chapter {n}",
+                  f"https://freewebnovel.test/novel/some-great-story/chapter-{n}")
+                 for n in range(1, 12)]
+    other_work = [(f"Other {n}",
+                   f"https://freewebnovel.test/novel/a-different-story/chapter-{n}")
+                  for n in range(1, 12)]
+    index_url = "https://freewebnovel.test/novel/some-great-story"
+
+    found = sources.find_chapter_links(same_work + other_work, index_url,
+                                       ids=set(), work_prefix=prefix)
+    assert len(found) == 11
+    for _l, u in found:
+        assert "a-different-story" not in u
+
+
+# ----------------------------------------------------------------------------
+# Bug 3 - fanfiction.net reads one chapter and stops
+# ----------------------------------------------------------------------------
+
+def test_guess_next_numeric_url_increments_short_trailing_numbers():
+    # The real case: fanfiction.net's chapter nav is a <select> plus JS
+    # onclick buttons, so there is no <a href> to another chapter anywhere on
+    # the page and both find_next_link and find_next_link_markdown are blind.
+    assert sources.guess_next_numeric_url("https://www.fanfiction.net/s/13857537/1/") \
+        == "https://www.fanfiction.net/s/13857537/2/"
+    assert sources.guess_next_numeric_url("https://x.test/story/chapter-5") \
+        == "https://x.test/story/chapter-6"
+    assert sources.guess_next_numeric_url("https://x.test/story/chapter_9") \
+        == "https://x.test/story/chapter_10"
+
+    # Must never increment a long site-assigned id - webnovel's chapter URLs
+    # end in a 17-18 digit id, and incrementing that walks into nonsense.
+    assert sources.guess_next_numeric_url(
+        "https://www.webnovel.com/book/x/97088154485448446") is None
+    assert sources.guess_next_numeric_url(
+        "https://www.fanfiction.net/s/13857537/") is None  # 8-digit story id alone
+
+    # Nothing to increment at all.
+    assert sources.guess_next_numeric_url("https://x.test/about") is None
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
