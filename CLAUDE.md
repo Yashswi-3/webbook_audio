@@ -57,8 +57,9 @@ written in reading order (webnovel's catalog runs 1, 56, latest-updates block,
 of the listing carries one — without it the mp3 narrates chapters out of order.
 
 **`app.py` — Flask, job orchestration, TTS.** `run_pipeline()` collects
-chapters → `build_book_text()` → `split_into_word_chunks()` (3000 words) →
-edge-tts, max 5 concurrent → merged by ffmpeg concat, with `_merge_via_pydub`
+chapters → `build_book_text()` → `split_into_word_chunks()` (1500 words, cut
+at a sentence end where one is in reach) → edge-tts, max 10 concurrent, one
+retry per chunk → merged by ffmpeg concat, with `_merge_via_pydub`
 as fallback. Routes: `/detect`, `/start`, `/start_from_file`, `/start_video`,
 `/stop`, `/progress`, `/download/<kind>`. Single Jinja template,
 `templates/index.html`.
@@ -112,11 +113,22 @@ missing `yt-dlp` reported as an interpreter mismatch).
 Env vars, all optional: `JINA_API_KEY` (lifts Jina's ~20 req/min anonymous
 limit), `GITHUB_TOKEN` (lifts 60 req/hr), `ALLOW_VIDEO_DOWNLOAD=0`. Tunables
 live at the top of `app.py` (`MAX_PAGES_DEFAULT` 25, `MAX_PAGES_HARD_CAP` 100,
-`WORDS_PER_CHUNK` 3000, `MAX_UPLOAD_SIZE_MB` 25) and `sources.py`
-(`MIN_ARTICLE_WORDS`, the yt-dlp clients, `MAX_VIDEO_MB` 500).
+`WORDS_PER_CHUNK` 1500, `MAX_UPLOAD_SIZE_MB` 25) and `sources.py`
+(`MIN_ARTICLE_WORDS`, the yt-dlp clients, `MAX_VIDEO_MB` 500,
+`CHAPTER_FETCH_CONCURRENCY` 4).
 
 `playwright` is left out of `requirements.txt` deliberately — the Dockerfile
 skips Chromium to save RAM, and Jina covers the same ground.
+
+### What is worth speeding up
+
+Measured, not guessed. Chunk size is the real lever on audio: a chunk is one
+edge-tts request and takes about as long as its text, so 24,000 words took 55s
+at 3000 words x5 concurrent and 22s at 1500 x10. Past ~10 concurrent the gain
+vanishes into noise. The ffmpeg merge is already a stream copy - 0.3s for a
+book - so there is nothing there to win. On fetching, only the index path can
+be parallel (8 real chapters: 12.5s sequential, 3.6s at 4 at a time); the
+chain-following crawl cannot, because page n+1's URL only exists on page n.
 
 ## Commit style
 

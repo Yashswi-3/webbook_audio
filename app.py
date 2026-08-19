@@ -23,6 +23,7 @@ Then open http://127.0.0.1:5000
 import asyncio
 import glob
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -53,8 +54,14 @@ MAX_PAGES_DEFAULT = 25
 MAX_PAGES_HARD_CAP = 100          # absolute ceiling regardless of the request
 VOICE_DEFAULT = "en-IN-NeerjaNeural"
 OUTPUT_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
-WORDS_PER_CHUNK = 3000
-MAX_CONCURRENT_TTS = 5             # how many edge-tts chunk requests run at once
+# A chunk is one edge-tts request, and a request takes about as long as the
+# text is long, so chunk size sets how much of the book can be spoken at once.
+# Measured on 24,000 words: 3000-word chunks 5 at a time took 55s, 1500-word
+# chunks 10 at a time took 22s. Past ~10 concurrent the gain disappears into
+# noise, so the smaller chunk is what actually buys the time.
+WORDS_PER_CHUNK = 1500
+MAX_CONCURRENT_TTS = 10            # how many edge-tts chunk requests run at once
+TTS_CHUNK_ATTEMPTS = 2             # one retry; a dropped chunk killed the job
 MAX_UPLOAD_SIZE_MB = 25            # cap on uploaded .txt file size
 
 # Video download (v2.5). On by default for local use. Set
@@ -215,19 +222,50 @@ def build_download_base(chapters, book_title):
 # Audio generation
 # ----------------------------------------------------------------------------
 
+_SENTENCE_END_RE = re.compile(r'[.!?]["\')\]]?$')
+
+
 def split_into_word_chunks(text, words_per_chunk=WORDS_PER_CHUNK):
+    """
+    Split into chunks of roughly words_per_chunk, preferring a sentence end.
+
+    Every chunk boundary is a join in the finished mp3, so landing one in the
+    middle of a sentence is audible. Smaller chunks mean more boundaries, so
+    the cut looks back over the last 15% of the chunk for a word that ends a
+    sentence and cuts there instead. Falls back to the hard word count when
+    there's no sentence end in reach.
+    """
     words = text.split()
+    lookback = max(1, words_per_chunk // 7)
     chunks = []
-    for i in range(0, len(words), words_per_chunk):
-        chunk = " ".join(words[i:i + words_per_chunk])
+    i = 0
+    while i < len(words):
+        end = min(i + words_per_chunk, len(words))
+        if end < len(words):
+            for j in range(end, max(end - lookback, i + 1), -1):
+                if _SENTENCE_END_RE.search(words[j - 1]):
+                    end = j
+                    break
+        chunk = " ".join(words[i:end])
         if chunk.strip():
             chunks.append(chunk)
+        i = end
     return chunks
 
 
 async def _tts_chunk_to_file(text, out_path, voice, rate):
-    communicate = edge_tts.Communicate(text, voice=voice, rate=rate)
-    await communicate.save(out_path)
+    # One retry: a single dropped connection used to take the whole job down
+    # after every other chunk had already been generated. Observed for real -
+    # a transient DNS failure to speech.platform.bing.com.
+    for attempt in range(1, TTS_CHUNK_ATTEMPTS + 1):
+        try:
+            communicate = edge_tts.Communicate(text, voice=voice, rate=rate)
+            await communicate.save(out_path)
+            return
+        except Exception:
+            if attempt == TTS_CHUNK_ATTEMPTS:
+                raise
+            await asyncio.sleep(2)
 
 
 async def _generate_chunks_concurrently(chunks, out_folder, voice, rate,

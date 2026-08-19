@@ -490,6 +490,40 @@ def test_missing_chapter_numbers_reports_holes_only_inside_the_range():
                                             {"chapter_num": None}]) == []
 
 
+
+def test_chunk_split_prefers_a_sentence_end_and_loses_nothing():
+    try:
+        import app as webapp
+    except ImportError:          # flask / edge-tts absent: nothing to test here
+        return
+
+    words = []
+    for i in range(60):
+        words += [f"w{i}"] * 9 + [f"end{i}."]
+    text = " ".join(words)                      # 600 words, a stop every 10th
+
+    chunks = webapp.split_into_word_chunks(text, words_per_chunk=100)
+    # Every cut lands on a sentence end rather than mid-sentence...
+    for chunk in chunks[:-1]:
+        assert chunk.rstrip().endswith("."), chunk[-40:]
+    # ...the target size is respected within the lookback window...
+    assert all(85 <= len(c.split()) <= 100 for c in chunks[:-1]),         [len(c.split()) for c in chunks]
+    # ...and not one word is dropped or duplicated.
+    assert " ".join(chunks).split() == text.split()
+
+
+def test_chunk_split_falls_back_to_the_word_count_without_sentence_ends():
+    try:
+        import app as webapp
+    except ImportError:
+        return
+
+    text = " ".join(["word"] * 250)              # no punctuation anywhere
+    chunks = webapp.split_into_word_chunks(text, words_per_chunk=100)
+    assert [len(c.split()) for c in chunks] == [100, 100, 50]
+    assert " ".join(chunks).split() == text.split()
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

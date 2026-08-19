@@ -37,6 +37,7 @@ import sys
 import tempfile
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin, urlparse, urlsplit
 
 import requests
@@ -64,6 +65,10 @@ except ImportError:
 
 REQUEST_TIMEOUT = 20
 PAGE_LOAD_WAIT_MS = 2500
+# Parallel fetches when the chapter list is known up front (the index path).
+# Low on purpose: politeness to the site being read, and Jina's anonymous
+# limit is roughly 20 requests a minute.
+CHAPTER_FETCH_CONCURRENCY = 4
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 WebBookAudioReader/2.0"
@@ -1529,40 +1534,70 @@ def discover_chapter_list(url, on_status):
     return []
 
 
+def _read_one_chapter(chapter_url):
+    """Fetch and extract a single chapter. Returns (title, text) or raises."""
+    check_cancelled()
+    html, _err = fetch_with_retry(chapter_url)
+    if html:
+        title, raw = extract_article(html, chapter_url)
+    else:
+        title, raw, _ = jina_read(chapter_url)
+    return title, clean_text(raw)
+
+
 def read_chapter_urls(chapter_urls, start_page, max_count, on_status, on_page):
-    """Read a known list of chapter URLs. Shared by the crawl's index fallback."""
+    """
+    Read a known list of chapter URLs. Shared by the crawl's index fallback.
+
+    The whole list is known up front, so the fetches run in parallel - the
+    chain-following crawl can't do that, since it only learns page n+1 by
+    reading page n. Results are consumed strictly in list order, so both the
+    progress log and the finished book stay in reading order no matter which
+    fetch finishes first. Kept deliberately modest: this is somebody's site
+    being read, not a load test, and every page may go through Jina, whose
+    anonymous limit is about 20 requests a minute.
+    """
     chapters = []
-    total = min(len(chapter_urls), max_count)
+    wanted = chapter_urls[:max_count]
+    total = len(wanted)
+    if not total:
+        return chapters
 
-    for offset, (label, chapter_url) in enumerate(chapter_urls[:max_count]):
-        check_cancelled()
-        page_num = start_page + offset
-        on_status(f"Chapter {offset + 1}/{total}: {label[:50]}")
+    check_cancelled()
+    pool = ThreadPoolExecutor(max_workers=min(CHAPTER_FETCH_CONCURRENCY, total))
+    futures = [pool.submit(_read_one_chapter, url) for _label, url in wanted]
 
-        html, err = fetch_with_retry(chapter_url)
-        if html:
-            title, raw = extract_article(html, chapter_url)
-        else:
+    try:
+        for offset, (label, chapter_url) in enumerate(wanted):
+            check_cancelled()
+            page_num = start_page + offset
+            on_status(f"Chapter {offset + 1}/{total}: {label[:50]}")
+
             try:
-                title, raw, _ = jina_read(chapter_url)
+                title, text = futures[offset].result()
             except SourceError as e:
                 on_page({"page": page_num, "url": chapter_url, "title": label,
                          "words": 0, "ok": False, "note": f"Failed: {e}"})
                 continue
 
-        text = clean_text(raw)
-        if text:
-            chapters.append({
-                "page": page_num, "url": chapter_url, "title": title or label,
-                "text": text,
-                "chapter_num": extract_chapter_number(label or title, chapter_url),
-            })
-            on_page({"page": page_num, "url": chapter_url,
-                     "title": title or label, "words": len(text.split()),
-                     "ok": True, "note": "Complete"})
-        else:
-            on_page({"page": page_num, "url": chapter_url, "title": label,
-                     "words": 0, "ok": False, "note": "Empty chapter, skipped"})
+            if text:
+                chapters.append({
+                    "page": page_num, "url": chapter_url,
+                    "title": title or label, "text": text,
+                    "chapter_num": extract_chapter_number(label or title,
+                                                          chapter_url),
+                })
+                on_page({"page": page_num, "url": chapter_url,
+                         "title": title or label, "words": len(text.split()),
+                         "ok": True, "note": "Complete"})
+            else:
+                on_page({"page": page_num, "url": chapter_url, "title": label,
+                         "words": 0, "ok": False,
+                         "note": "Empty chapter, skipped"})
+    finally:
+        # cancel_futures so pressing Stop doesn't sit through the whole queue;
+        # wait=False so it doesn't sit through the in-flight fetches either.
+        pool.shutdown(wait=False, cancel_futures=True)
 
     return chapters
 
