@@ -1235,6 +1235,9 @@ _DIGIT_RUN_RE = re.compile(r"\d+")
 # handful of sibling links from being mistaken for one - measured: a webnovel
 # chapter page's dominant shape has 3 links, its book page has 280.
 MIN_INDEX_LINKS = 8
+# How much of a listing has to carry a chapter number before those numbers are
+# trusted enough to sort by. Measured on webnovel's catalog: 52 of 59 links.
+MIN_NUMBERED_RATIO = 0.6
 _INDEX_LABEL_RE = re.compile(
     r"table of contents|catalog|contents|chapter list|all chapters|index",
     re.IGNORECASE,
@@ -1392,7 +1395,54 @@ def find_chapter_links(links, index_url, ids=None, work_prefix=None):
         if url not in seen:
             seen.add(url)
             ordered.append((label, url))
-    return ordered
+    return order_chapter_listing(ordered)
+
+
+def order_chapter_listing(listing):
+    """
+    Put a chapter listing into reading order.
+
+    An index page is not written in reading order. webnovel's catalog opens
+    with a "Read" button pointing at chapter 1, follows it with a "latest
+    updates" block holding the newest chapters, and only then lists the book
+    from chapter 2 - so reading it in document order narrates 1, 56, three
+    late chapters, 2, 3. Measured on the real catalog: the first fifteen
+    chapter numbers in document order are 1, 56, -, -, -, 2, 3, 4...
+
+    Sort by chapter number when most of the listing carries one. When it
+    doesn't, document order is the only signal there is, so leave it alone.
+    Entries with no number keep document order at the end: on the sites that
+    mix the two, those are the newest chapters.
+    """
+    numbered, plain = [], []
+    for label, url in listing:
+        num = extract_chapter_number(label, url)
+        if num is None:
+            plain.append((label, url))
+        else:
+            numbered.append((num, label, url))
+
+    if len(numbered) < 2 or len(numbered) < MIN_NUMBERED_RATIO * len(listing):
+        return listing
+
+    numbered.sort(key=lambda item: item[0])
+    return [(label, url) for _num, label, url in numbered] + plain
+
+
+def missing_chapter_numbers(chapters):
+    """
+    Chapter numbers between the first and last collected that never arrived.
+
+    A chapter that fails to fetch or comes back empty is skipped and the crawl
+    continues, which is right - but a book that jumps from 1 to 3 with nothing
+    said about it reads like the app scrambled the order.
+    """
+    nums = sorted({c["chapter_num"] for c in chapters
+                   if c.get("chapter_num") is not None})
+    if len(nums) < 2:
+        return []
+    present = set(nums)
+    return [n for n in range(nums[0], nums[-1] + 1) if n not in present]
 
 
 def _parent_url(url):
@@ -1764,6 +1814,16 @@ def fetch_crawl(url, max_pages, on_status, on_page):
             "\"next page\" link was found. Sites that paginate with a "
             "JavaScript button instead of a real link can't be followed."
         )
+
+    # A hole in the numbering means a chapter was skipped mid-book. Say which
+    # ones rather than shipping an mp3 that jumps from 1 to 3.
+    gaps = missing_chapter_numbers(chapters)
+    if gaps:
+        listed = ", ".join(str(n) for n in gaps[:10])
+        more = " and others" if len(gaps) > 10 else ""
+        gap_note = (f"Chapters {listed}{more} came back unreadable, so the "
+                    "book skips from the chapter before them to the one after.")
+        warning = f"{warning} {gap_note}" if warning else gap_note
 
     return {"chapters": chapters, "book_title": book_title, "warning": warning}
 

@@ -448,6 +448,48 @@ def test_guess_next_numeric_url_increments_short_trailing_numbers():
     assert sources.guess_next_numeric_url("https://x.test/about") is None
 
 
+
+def test_chapter_listing_is_sorted_into_reading_order():
+    # The shape webnovel's catalog really has: a "Read" button on chapter 1,
+    # then a latest-updates block, then the full list starting at chapter 2.
+    base = "https://www.webnovel.com/book/36163297308457405/"
+    listing = [
+        ("Read", base + "chapter-1-michael-jackson._97088154485448446"),
+        ("Chapter 56: Hei Fan's inheritance", base + "chapter-56-hei-fan._98448090515689749"),
+        ("Upper Moon's Falna. 1 months ago", base + "upper-moons-falna._97630234253253575"),
+        ("2 Chapter 2: The meeting", base + "chapter-2-the-meeting._97088154485448447"),
+        ("3 Chapter 3: The fight", base + "chapter-3-the-fight._97088154485448448"),
+        ("4 Chapter 4: After", base + "chapter-4-after._97088154485448449"),
+        ("5 Chapter 5: Later", base + "chapter-5-later._97088154485448450"),
+        ("6 Chapter 6: Even later", base + "chapter-6-even-later._97088154485448451"),
+    ]
+    ordered = sources.order_chapter_listing(listing)
+    nums = [sources.extract_chapter_number(l, u) for l, u in ordered]
+    assert nums == [1, 2, 3, 4, 5, 6, 56, None], nums
+
+
+def test_chapter_listing_keeps_document_order_when_mostly_unnumbered():
+    # A book whose links carry no numbers has nothing to sort by, so the page's
+    # own order is the best available answer and must survive untouched.
+    listing = [("Prologue", "https://x.test/b/prologue"),
+               ("The Arrival", "https://x.test/b/the-arrival"),
+               ("Dusk", "https://x.test/b/dusk"),
+               ("Chapter 4", "https://x.test/b/chapter-4")]
+    assert sources.order_chapter_listing(listing) == listing
+
+
+def test_missing_chapter_numbers_reports_holes_only_inside_the_range():
+    chapters = [{"chapter_num": 1}, {"chapter_num": 3}, {"chapter_num": 4},
+                {"chapter_num": 7}]
+    assert sources.missing_chapter_numbers(chapters) == [2, 5, 6]
+    # A complete run, a single chapter and an unnumbered book all have no gaps.
+    assert sources.missing_chapter_numbers([{"chapter_num": 1},
+                                            {"chapter_num": 2}]) == []
+    assert sources.missing_chapter_numbers([{"chapter_num": 9}]) == []
+    assert sources.missing_chapter_numbers([{"chapter_num": None},
+                                            {"chapter_num": None}]) == []
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

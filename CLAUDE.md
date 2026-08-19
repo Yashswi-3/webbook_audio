@@ -51,7 +51,10 @@ because the Docker image skips Chromium on purpose.
 `discover_chapter_list()` finds the site's index page and `find_chapter_links()`
 filters it — and that filter is where the bugs live. It scopes links by work
 ID (`_WORK_ID_RE`, 6+ digit ids) and URL shape so an index doesn't drag in
-fifteen unrelated novels; a change here needs a test.
+fifteen unrelated novels; a change here needs a test. Index pages are not
+written in reading order (webnovel's catalog runs 1, 56, latest-updates block,
+2, 3...), so `order_chapter_listing()` sorts by chapter number whenever most
+of the listing carries one — without it the mp3 narrates chapters out of order.
 
 **`app.py` — Flask, job orchestration, TTS.** `run_pipeline()` collects
 chapters → `build_book_text()` → `split_into_word_chunks()` (3000 words) →
