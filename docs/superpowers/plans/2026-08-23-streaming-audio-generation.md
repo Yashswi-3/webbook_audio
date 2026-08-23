@@ -74,7 +74,7 @@ def test_streaming_chunker_crosses_chapter_boundaries_without_losing_words():
 Run:
 
 ```powershell
-& 'C:\Users\yashswi shukla\AppData\Local\Microsoft\WinGet\Links\uv.exe' run --isolated --managed-python --python 3.13 --with-requirements requirements.txt -m pytest test_sources.py -q -k streaming_chunker
+& 'C:\Users\yashswi shukla\AppData\Local\Microsoft\WinGet\Links\uv.exe' run --isolated --managed-python --python 3.13 --with-requirements requirements.txt --with pytest -m pytest test_sources.py -q -k streaming_chunker
 ```
 
 Expected: FAIL because `app.StreamingWordChunker` does not exist.
@@ -471,7 +471,7 @@ Run both:
 
 ```powershell
 & 'C:\Users\yashswi shukla\AppData\Local\Microsoft\WinGet\Links\uv.exe' run --isolated --managed-python --python 3.13 --with-requirements requirements.txt test_sources.py
-& 'C:\Users\yashswi shukla\AppData\Local\Microsoft\WinGet\Links\uv.exe' run --isolated --managed-python --python 3.13 --with-requirements requirements.txt -m pytest test_sources.py -q
+& 'C:\Users\yashswi shukla\AppData\Local\Microsoft\WinGet\Links\uv.exe' run --isolated --managed-python --python 3.13 --with-requirements requirements.txt --with pytest -m pytest test_sources.py -q
 ```
 
 Expected: the same complete test count passes through both supported runners.
