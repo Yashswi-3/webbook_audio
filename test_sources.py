@@ -524,6 +524,158 @@ def test_chunk_split_falls_back_to_the_word_count_without_sentence_ends():
     assert " ".join(chunks).split() == text.split()
 
 
+def test_streaming_chunker_crosses_chapter_boundaries_without_losing_words():
+    try:
+        import app as webapp
+    except ImportError:
+        return
+
+    chunker = webapp.StreamingWordChunker(words_per_chunk=20)
+    chapters = [
+        " ".join(f"a{i}" for i in range(13)),
+        " ".join([*(f"b{i}" for i in range(5)), "sentence.",
+                  *(f"b{i}" for i in range(6, 19))]),
+        " ".join(f"c{i}" for i in range(17)),
+    ]
+
+    chunks = []
+    for chapter in chapters:
+        chunks.extend(chunker.add_text(chapter))
+    chunks.extend(chunker.flush())
+
+    assert " ".join(chunks).split() == " ".join(chapters).split()
+    assert all(len(chunk.split()) <= 20 for chunk in chunks)
+    assert chunker.flush() == []
+
+
+def test_streaming_audio_starts_before_finish():
+    import os
+    import shutil
+    import tempfile
+    import threading
+    import app as webapp
+
+    folder = tempfile.mkdtemp(prefix="wba_stream_")
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_tts(text, path, voice, rate):
+        started.set()
+        assert release.wait(2)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    try:
+        builder = webapp.StreamingAudioBuilder(
+            folder, "voice", "+0%", words_per_chunk=10,
+            max_concurrent=1, tts_fn=fake_tts)
+        builder.add_text(" ".join(f"w{i}" for i in range(10)))
+        assert started.wait(1), "TTS did not start before collection finished"
+        release.set()
+        paths = builder.finish()
+        assert [os.path.basename(p) for p in paths] == ["part1.mp3"]
+    finally:
+        release.set()
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def test_streaming_audio_returns_parts_in_text_order():
+    import os
+    import shutil
+    import tempfile
+    import app as webapp
+
+    folder = tempfile.mkdtemp(prefix="wba_stream_")
+
+    def fake_tts(text, path, voice, rate):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    words = [f"w{i}" for i in range(25)]
+    try:
+        builder = webapp.StreamingAudioBuilder(
+            folder, "voice", "+0%", words_per_chunk=10,
+            max_concurrent=2, tts_fn=fake_tts)
+        builder.add_text(" ".join(words))
+        paths = builder.finish()
+
+        narrated = []
+        for path in paths:
+            with open(path, encoding="utf-8") as f:
+                narrated.extend(f.read().split())
+        assert [os.path.basename(p) for p in paths] == [
+            "part1.mp3", "part2.mp3", "part3.mp3"]
+        assert narrated == words
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def test_streaming_audio_respects_concurrency_limit():
+    import shutil
+    import tempfile
+    import threading
+    import time
+    import app as webapp
+
+    folder = tempfile.mkdtemp(prefix="wba_stream_")
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_tts(text, path, voice, rate):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.05)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        finally:
+            with lock:
+                active -= 1
+
+    try:
+        builder = webapp.StreamingAudioBuilder(
+            folder, "voice", "+0%", words_per_chunk=5,
+            max_concurrent=2, tts_fn=fake_tts)
+        builder.add_text(" ".join(f"w{i}" for i in range(30)))
+        builder.finish()
+        assert max_active == 2
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def test_streaming_audio_abort_removes_finished_parts():
+    import glob
+    import os
+    import shutil
+    import tempfile
+    import threading
+    import time
+    import app as webapp
+
+    folder = tempfile.mkdtemp(prefix="wba_stream_")
+    started = threading.Event()
+
+    def fake_tts(text, path, voice, rate):
+        started.set()
+        time.sleep(0.05)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    try:
+        builder = webapp.StreamingAudioBuilder(
+            folder, "voice", "+0%", words_per_chunk=5,
+            max_concurrent=1, tts_fn=fake_tts)
+        builder.add_text(" ".join(f"w{i}" for i in range(20)))
+        assert started.wait(1)
+        builder.abort()
+        assert glob.glob(os.path.join(folder, "part*.mp3")) == []
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

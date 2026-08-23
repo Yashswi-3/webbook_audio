@@ -28,6 +28,7 @@ import subprocess
 import sys
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, send_from_directory, render_template
@@ -225,6 +226,16 @@ def build_download_base(chapters, book_title):
 _SENTENCE_END_RE = re.compile(r'[.!?]["\')\]]?$')
 
 
+def _sentence_aware_end(words, words_per_chunk):
+    """Cut at a nearby sentence end, or at the requested word count."""
+    end = min(words_per_chunk, len(words))
+    lookback = max(1, words_per_chunk // 7)
+    for j in range(end, max(end - lookback, 1), -1):
+        if _SENTENCE_END_RE.search(words[j - 1]):
+            return j
+    return end
+
+
 def split_into_word_chunks(text, words_per_chunk=WORDS_PER_CHUNK):
     """
     Split into chunks of roughly words_per_chunk, preferring a sentence end.
@@ -236,21 +247,41 @@ def split_into_word_chunks(text, words_per_chunk=WORDS_PER_CHUNK):
     there's no sentence end in reach.
     """
     words = text.split()
-    lookback = max(1, words_per_chunk // 7)
     chunks = []
     i = 0
     while i < len(words):
         end = min(i + words_per_chunk, len(words))
         if end < len(words):
-            for j in range(end, max(end - lookback, i + 1), -1):
-                if _SENTENCE_END_RE.search(words[j - 1]):
-                    end = j
-                    break
+            end = i + _sentence_aware_end(words[i:end], words_per_chunk)
         chunk = " ".join(words[i:end])
         if chunk.strip():
             chunks.append(chunk)
         i = end
     return chunks
+
+
+class StreamingWordChunker:
+    """Emit complete sentence-aware chunks while retaining the final tail."""
+
+    def __init__(self, words_per_chunk=WORDS_PER_CHUNK):
+        self.words_per_chunk = words_per_chunk
+        self.words = []
+
+    def add_text(self, text):
+        self.words.extend((text or "").split())
+        chunks = []
+        while len(self.words) >= self.words_per_chunk:
+            end = _sentence_aware_end(self.words, self.words_per_chunk)
+            chunks.append(" ".join(self.words[:end]))
+            del self.words[:end]
+        return chunks
+
+    def flush(self):
+        if not self.words:
+            return []
+        chunk = " ".join(self.words)
+        self.words.clear()
+        return [chunk]
 
 
 async def _tts_chunk_to_file(text, out_path, voice, rate):
@@ -266,6 +297,114 @@ async def _tts_chunk_to_file(text, out_path, voice, rate):
             if attempt == TTS_CHUNK_ATTEMPTS:
                 raise
             await asyncio.sleep(2)
+
+
+def _tts_chunk_sync(text, out_path, voice, rate):
+    asyncio.run(_tts_chunk_to_file(text, out_path, voice, rate))
+
+
+class StreamingAudioBuilder:
+    """Turn arriving text into numbered audio parts with bounded concurrency."""
+
+    def __init__(self, out_folder, voice, rate, progress_cb=None,
+                 max_concurrent=MAX_CONCURRENT_TTS,
+                 words_per_chunk=WORDS_PER_CHUNK, tts_fn=None):
+        if tts_fn is None and edge_tts is None:
+            raise RuntimeError("edge-tts is not installed. Run: pip install edge-tts")
+        self.out_folder = out_folder
+        self.voice = voice
+        self.rate = rate
+        self.progress_cb = progress_cb
+        self.tts_fn = tts_fn or _tts_chunk_sync
+        self.chunker = StreamingWordChunker(words_per_chunk)
+        self.executor = ThreadPoolExecutor(max_workers=max_concurrent)
+        self.futures = []
+        self.part_paths = []
+        self.completed = 0
+        self.first_error = None
+        self.lock = threading.Lock()
+        self.closed = False
+        self.shutdown_complete = False
+
+    def _record_completion(self, future):
+        with self.lock:
+            if future.cancelled():
+                return
+            error = future.exception()
+            if error is not None:
+                if self.first_error is None:
+                    self.first_error = error
+            else:
+                self.completed += 1
+            done = self.completed
+            total = len(self.futures)
+        if self.progress_cb:
+            self.progress_cb(done, total)
+
+    def _raise_if_failed(self):
+        with self.lock:
+            error = self.first_error
+        if error is not None:
+            raise error
+
+    def _submit(self, text):
+        index = len(self.part_paths) + 1
+        path = os.path.join(self.out_folder, f"part{index}.mp3")
+        self.part_paths.append(path)
+        future = self.executor.submit(
+            self.tts_fn, text, path, self.voice, self.rate)
+        self.futures.append(future)
+        future.add_done_callback(self._record_completion)
+
+    def add_text(self, text):
+        if self.closed:
+            raise RuntimeError("Cannot add text after audio input is finished.")
+        self._raise_if_failed()
+        for chunk in self.chunker.add_text(text):
+            self._submit(chunk)
+
+    def finish(self, on_wait_start=None):
+        if not self.closed:
+            self._raise_if_failed()
+            for chunk in self.chunker.flush():
+                self._submit(chunk)
+            self.closed = True
+
+        if not self.futures:
+            self._shutdown(cancel_futures=False)
+            raise RuntimeError("No text available to convert to audio.")
+
+        if on_wait_start:
+            with self.lock:
+                on_wait_start(self.completed, len(self.futures))
+
+        self._shutdown(cancel_futures=False)
+        try:
+            for future in self.futures:
+                future.result()
+            self._raise_if_failed()
+        except Exception:
+            self.cleanup()
+            raise
+        return list(self.part_paths)
+
+    def _shutdown(self, cancel_futures):
+        if self.shutdown_complete:
+            return
+        self.executor.shutdown(wait=True, cancel_futures=cancel_futures)
+        self.shutdown_complete = True
+
+    def cleanup(self):
+        for path in self.part_paths:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def abort(self):
+        self.closed = True
+        self._shutdown(cancel_futures=True)
+        self.cleanup()
 
 
 async def _generate_chunks_concurrently(chunks, out_folder, voice, rate,
