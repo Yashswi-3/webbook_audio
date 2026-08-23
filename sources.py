@@ -17,10 +17,11 @@ platforms that aren't narratable (V2EX threads, Xueqiu stock quotes, Bilibili)
 are left out too.
 
 Handler contract:
-    handler(url, max_pages, on_status, on_page) -> {"chapters": [...],
-                                                    "book_title": str}
+    handler(url, max_pages, on_status, on_page, on_chapter=None)
+        -> {"chapters": [...], "book_title": str}
   on_status(str)   - one-line progress message for the UI
   on_page(dict)    - append to the per-page log
+  on_chapter(dict) - optional ordered callback for each accepted chapter
   raises SourceError(msg) on anything the user needs to know about
 """
 
@@ -147,6 +148,13 @@ def check_cancelled():
     """Raise JobCancelled if the user pressed Stop. Call at loop boundaries."""
     if _cancel_check is not None and _cancel_check():
         raise JobCancelled("Stopped.")
+
+
+def _add_chapter(chapters, chapter, on_chapter=None):
+    """Append an accepted chapter, then emit it in that same reading order."""
+    chapters.append(chapter)
+    if on_chapter:
+        on_chapter(chapter)
 
 
 # ----------------------------------------------------------------------------
@@ -950,7 +958,7 @@ def download_video(url, out_folder, on_status, on_percent=None):
     return title or "video"
 
 
-def fetch_youtube(url, max_pages, on_status, on_page):
+def fetch_youtube(url, max_pages, on_status, on_page, on_chapter=None):
     """
     Video or playlist -> transcript chapters, using the official/auto captions.
 
@@ -1014,10 +1022,10 @@ def fetch_youtube(url, max_pages, on_status, on_page):
 
             video_url = f"https://www.youtube.com/watch?v={vid}"
             if text:
-                chapters.append({
+                _add_chapter(chapters, {
                     "page": i, "url": video_url, "title": title, "text": text,
                     "chapter_num": i if len(entries) > 1 else None,
-                })
+                }, on_chapter)
                 on_page({"page": i, "url": video_url, "title": title,
                          "words": len(text.split()), "ok": True,
                          "note": "YouTube captions"})
@@ -1059,7 +1067,7 @@ def _entry_text(entry):
     return BeautifulSoup(raw, "html.parser").get_text("\n", strip=True)
 
 
-def fetch_rss(url, max_pages, on_status, on_page):
+def fetch_rss(url, max_pages, on_status, on_page, on_chapter=None):
     """
     Each feed entry becomes a chapter. Feeds that only publish a summary get
     the linked article pulled in full through the normal extractor ladder.
@@ -1094,8 +1102,10 @@ def fetch_rss(url, max_pages, on_status, on_page):
                     text = full
 
         if text:
-            chapters.append({"page": i, "url": link, "title": title,
-                             "text": text, "chapter_num": i})
+            _add_chapter(chapters,
+                         {"page": i, "url": link, "title": title,
+                          "text": text, "chapter_num": i},
+                         on_chapter)
             on_page({"page": i, "url": link, "title": title,
                      "words": len(text.split()), "ok": True, "note": "Feed entry"})
         else:
@@ -1151,7 +1161,7 @@ def _gh_decode(node):
         return ""
 
 
-def fetch_github(url, max_pages, on_status, on_page):
+def fetch_github(url, max_pages, on_status, on_page, on_chapter=None):
     """
     A public repo's prose: README first, then docs/*.md, then any other
     top-level .md. A direct /blob/ link to one file reads just that file.
@@ -1172,8 +1182,12 @@ def fetch_github(url, max_pages, on_status, on_page):
             raise SourceError(f"Could not read text from {path}.")
         on_page({"page": 1, "url": url, "title": path,
                  "words": len(text.split()), "ok": True, "note": "GitHub file"})
-        return {"chapters": [{"page": 1, "url": url, "title": path,
-                              "text": text, "chapter_num": None}],
+        chapters = []
+        _add_chapter(chapters,
+                     {"page": 1, "url": url, "title": path,
+                      "text": text, "chapter_num": None},
+                     on_chapter)
+        return {"chapters": chapters,
                 "book_title": f"{repo} {os.path.basename(path)}"}
 
     on_status(f"Reading {owner}/{repo} docs from GitHub...")
@@ -1213,8 +1227,10 @@ def fetch_github(url, max_pages, on_status, on_page):
         text = clean_text(markdown_to_speech_text(raw))
         page_url = f"https://github.com/{owner}/{repo}"
         if text:
-            chapters.append({"page": i, "url": page_url, "title": title,
-                             "text": text, "chapter_num": None})
+            _add_chapter(chapters,
+                         {"page": i, "url": page_url, "title": title,
+                          "text": text, "chapter_num": None},
+                         on_chapter)
             on_page({"page": i, "url": page_url, "title": title,
                      "words": len(text.split()), "ok": True, "note": "GitHub doc"})
         else:
@@ -1545,7 +1561,8 @@ def _read_one_chapter(chapter_url):
     return title, clean_text(raw)
 
 
-def read_chapter_urls(chapter_urls, start_page, max_count, on_status, on_page):
+def read_chapter_urls(chapter_urls, start_page, max_count, on_status, on_page,
+                      on_chapter=None):
     """
     Read a known list of chapter URLs. Shared by the crawl's index fallback.
 
@@ -1581,12 +1598,12 @@ def read_chapter_urls(chapter_urls, start_page, max_count, on_status, on_page):
                 continue
 
             if text:
-                chapters.append({
+                _add_chapter(chapters, {
                     "page": page_num, "url": chapter_url,
                     "title": title or label, "text": text,
                     "chapter_num": extract_chapter_number(label or title,
                                                           chapter_url),
-                })
+                }, on_chapter)
                 on_page({"page": page_num, "url": chapter_url,
                          "title": title or label, "words": len(text.split()),
                          "ok": True, "note": "Complete"})
@@ -1615,7 +1632,7 @@ _FEED_SNIFF_RE = re.compile(
 )
 
 
-def fetch_crawl(url, max_pages, on_status, on_page):
+def fetch_crawl(url, max_pages, on_status, on_page, on_chapter=None):
     """
     Follow the "next page" chain from a starting URL, extracting article text
     from each. Unchanged from v1 except that extraction now falls through to
@@ -1682,11 +1699,11 @@ def fetch_crawl(url, max_pages, on_status, on_page):
                 break
 
             if text:
-                chapters.append({
+                _add_chapter(chapters, {
                     "page": page_num, "url": current_url,
                     "title": j_title or current_url, "text": text,
                     "chapter_num": extract_chapter_number(j_title, current_url),
-                })
+                }, on_chapter)
                 on_page({"page": page_num, "url": current_url,
                          "title": j_title or current_url,
                          "words": len(text.split()), "ok": True,
@@ -1718,7 +1735,8 @@ def fetch_crawl(url, max_pages, on_status, on_page):
         # A feed handed in as a plain URL: hand off rather than scraping XML.
         if page_num == 1 and _FEED_SNIFF_RE.search(html[:2048]):
             on_status("That URL is a feed — switching to the RSS reader.")
-            return fetch_rss(current_url, max_pages, on_status, on_page)
+            return fetch_rss(current_url, max_pages, on_status, on_page,
+                             on_chapter)
 
         if looks_like_blocked_page(html):
             on_page({"page": page_num, "url": current_url, "title": None,
@@ -1750,9 +1768,12 @@ def fetch_crawl(url, max_pages, on_status, on_page):
             on_page({"page": page_num, "url": current_url, "title": title,
                      "words": 0, "ok": False, "note": "Empty article, skipped"})
         else:
-            chapters.append({"page": page_num, "url": current_url, "title": title,
-                             "text": text,
-                             "chapter_num": extract_chapter_number(title, current_url)})
+            _add_chapter(
+                chapters,
+                {"page": page_num, "url": current_url, "title": title,
+                 "text": text,
+                 "chapter_num": extract_chapter_number(title, current_url)},
+                on_chapter)
             on_page({"page": page_num, "url": current_url, "title": title,
                      "words": len(text.split()), "ok": True, "note": "Complete"})
         prev_title = title or prev_title
@@ -1806,7 +1827,7 @@ def fetch_crawl(url, max_pages, on_status, on_page):
                 on_status(f"Found {len(listing)} chapters in the index.")
                 chapters.extend(read_chapter_urls(
                     remaining, len(chapters) + 1, max_pages - len(chapters),
-                    on_status, on_page))
+                    on_status, on_page, on_chapter))
                 used_reader_fallback = False   # the index path carried it
 
     if not chapters:
@@ -1867,14 +1888,18 @@ def fetch_crawl(url, max_pages, on_status, on_page):
 # Handler: pasted text (upload path)
 # ----------------------------------------------------------------------------
 
-def fetch_uploaded_text(raw_text, source_name, on_page):
+def fetch_uploaded_text(raw_text, source_name, on_page, on_chapter=None):
     text = clean_text(raw_text)
     if not text:
         raise SourceError("The uploaded file has no readable text.")
     on_page({"page": 1, "url": source_name, "title": source_name,
              "words": len(text.split()), "ok": True, "note": "Uploaded file"})
-    return {"chapters": [{"page": 1, "url": source_name, "title": source_name,
-                          "text": text, "chapter_num": None}],
+    chapters = []
+    _add_chapter(chapters,
+                 {"page": 1, "url": source_name, "title": source_name,
+                  "text": text, "chapter_num": None},
+                 on_chapter)
+    return {"chapters": chapters,
             "book_title": os.path.splitext(source_name)[0]}
 
 

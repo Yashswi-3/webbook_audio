@@ -676,6 +676,58 @@ def test_streaming_audio_abort_removes_finished_parts():
         shutil.rmtree(folder, ignore_errors=True)
 
 
+def test_add_chapter_appends_before_emitting_the_same_object():
+    chapters = []
+    seen = []
+    chapter = {"page": 1, "text": "hello"}
+
+    sources._add_chapter(
+        chapters, chapter,
+        lambda emitted: seen.append((len(chapters), emitted)))
+
+    assert chapters == [chapter]
+    assert seen == [(1, chapter)]
+
+
+def test_uploaded_text_emits_its_chapter():
+    seen = []
+    result = sources.fetch_uploaded_text(
+        "one two three", "sample.txt", lambda page: None, seen.append)
+
+    assert seen == result["chapters"]
+
+
+def test_known_index_emits_chapters_in_listing_order():
+    import threading
+
+    first = "https://example.test/book/chapter-1"
+    second = "https://example.test/book/chapter-2"
+    second_finished = threading.Event()
+    completion_order = []
+    seen = []
+    original = sources._read_one_chapter
+
+    def fake_read(url):
+        if url == first:
+            assert second_finished.wait(1)
+        else:
+            second_finished.set()
+        completion_order.append(url)
+        return f"Title {url[-1]}", f"Text {url[-1]}"
+
+    sources._read_one_chapter = fake_read
+    try:
+        chapters = sources.read_chapter_urls(
+            [("Chapter 1", first), ("Chapter 2", second)],
+            1, 2, lambda message: None, lambda page: None, seen.append)
+    finally:
+        sources._read_one_chapter = original
+
+    assert completion_order == [second, first]
+    assert [chapter["url"] for chapter in chapters] == [first, second]
+    assert seen == chapters
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
