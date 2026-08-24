@@ -46,6 +46,20 @@ python app.py
 
 Open http://127.0.0.1:5000
 
+## How audio generation works
+
+Chapters are still saved in reading order, but narration no longer waits for
+the whole book to finish downloading. Accepted chapter text flows into a
+sentence-aware 1500-word buffer. Whenever that buffer fills, its numbered MP3
+part starts immediately, with at most 10 edge-tts requests running at once.
+After the last chapter, the remaining text is narrated and ffmpeg joins all
+numbered parts once, in order, into `book.mp3`.
+
+This overlaps page fetching with narration. Long or slow-to-fetch books save
+the most time; short books may see little difference because the final merge
+was already fast. A failed or stopped job removes temporary audio parts, so a
+partial MP3 is never presented as complete.
+
 ## How the web reader gets text
 
 Three rungs, cheapest first. Each page stops at the first one that returns
@@ -138,7 +152,8 @@ Defaults live at the top of `app.py` and `sources.py`:
 ```python
 MAX_PAGES_DEFAULT = 25         # app.py
 MAX_PAGES_HARD_CAP = 100
-WORDS_PER_CHUNK = 3000
+WORDS_PER_CHUNK = 1500
+MAX_CONCURRENT_TTS = 10
 MIN_ARTICLE_WORDS = 120        # sources.py - below this, Jina rescue fires
 YTDLP_PLAYER_CLIENTS = "web_safari,mweb,web_embedded"   # captions
 YTDLP_VIDEO_CLIENT = "android"                          # mp4 download
@@ -179,8 +194,9 @@ clients hit "Sign in to confirm you're not a bot" while those three don't.
 python test_sources.py
 ```
 
-Offline — no network, no ffmpeg, no keys. Covers URL security, the router,
-VTT caption dedupe, and Markdown-to-speech stripping.
+Offline — no network, no ffmpeg, no keys. Covers URL security, routing,
+chapter order, streaming audio overlap and cleanup, VTT caption dedupe, and
+Markdown-to-speech stripping.
 
 ## Known limits
 

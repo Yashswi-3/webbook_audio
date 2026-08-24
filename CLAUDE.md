@@ -32,8 +32,10 @@ Two files carry everything. Keep it that way.
 picks one of four handlers in `HANDLERS`: `fetch_crawl` (web), `fetch_youtube`
 (captions), `fetch_github`, `fetch_rss`. Uploaded `.txt` bypasses routing via
 `fetch_uploaded_text`. Every handler has the same shape —
-`(url, max_pages, on_status, on_page)` — and yields chapters, so a new source
-type is one function plus a `HANDLERS` entry.
+`(url, max_pages, on_status, on_page, on_chapter=None)` — and returns chapters.
+It calls `on_chapter` only after accepting each chapter in final reading order,
+which lets narration overlap collection. A new source type is one function plus
+a `HANDLERS` entry.
 
 `resolve_source()` deliberately only runs the reachability probe for the `web`
 route. YouTube/GitHub/RSS never fetch the pasted URL themselves (yt-dlp uses
@@ -56,12 +58,17 @@ written in reading order (webnovel's catalog runs 1, 56, latest-updates block,
 2, 3...), so `order_chapter_listing()` sorts by chapter number whenever most
 of the listing carries one — without it the mp3 narrates chapters out of order.
 
-**`app.py` — Flask, job orchestration, TTS.** `run_pipeline()` collects
-chapters → `build_book_text()` → `split_into_word_chunks()` (1500 words, cut
-at a sentence end where one is in reach) → edge-tts, max 10 concurrent, one
-retry per chunk → merged by ffmpeg concat, with `_merge_via_pydub`
-as fallback. Routes: `/detect`, `/start`, `/start_from_file`, `/start_video`,
-`/stop`, `/progress`, `/download/<kind>`. Single Jinja template,
+**`app.py` — Flask, job orchestration, TTS.** `run_pipeline()` creates a
+`StreamingAudioBuilder` before collection. Each accepted chapter feeds a
+rolling, sentence-aware 1500-word buffer; full chunks start edge-tts
+immediately, max 10 concurrent. Numbered parts retain text order even when
+requests finish out of order. After collection, the remainder is submitted and
+all parts are merged once by ffmpeg concat, with `_merge_via_pydub` as fallback.
+Do not incrementally re-merge the growing MP3. Shutdown waits for active workers
+before the shared output directory can be reused.
+The MP3 is all-or-nothing: errors and cancellation remove temporary parts.
+Routes: `/detect`, `/start`, `/start_from_file`, `/start_video`, `/stop`,
+`/progress`, `/download/<kind>`. Single Jinja template,
 `templates/index.html`.
 
 ### One job at a time
@@ -126,9 +133,11 @@ Measured, not guessed. Chunk size is the real lever on audio: a chunk is one
 edge-tts request and takes about as long as its text, so 24,000 words took 55s
 at 3000 words x5 concurrent and 22s at 1500 x10. Past ~10 concurrent the gain
 vanishes into noise. The ffmpeg merge is already a stream copy - 0.3s for a
-book - so there is nothing there to win. On fetching, only the index path can
-be parallel (8 real chapters: 12.5s sequential, 3.6s at 4 at a time); the
-chain-following crawl cannot, because page n+1's URL only exists on page n.
+book - so there is nothing there to win. Streaming overlaps collection and TTS,
+so its upper-bound saving is roughly the shorter of those two stages; short
+jobs gain less. On fetching, only the index path can be parallel (8 real
+chapters: 12.5s sequential, 3.6s at 4 at a time); the chain-following crawl
+cannot, because page n+1's URL only exists on page n.
 
 ## Commit style
 
