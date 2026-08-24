@@ -728,6 +728,232 @@ def test_known_index_emits_chapters_in_listing_order():
     assert seen == chapters
 
 
+def _run_fake_streaming_pipeline(handler, fake_tts, max_concurrent=2):
+    import contextlib
+    import glob
+    import io
+    import os
+    import shutil
+    import tempfile
+    import app as webapp
+
+    folder = tempfile.mkdtemp(prefix="wba_pipeline_")
+    merged_parts = []
+    original_output = webapp.OUTPUT_FOLDER
+    original_merge = webapp._merge_via_ffmpeg_concat
+    original_fallback = webapp._merge_via_pydub
+    original_state = dict(webapp.job_state)
+    missing = object()
+    original_factory = getattr(webapp, "STREAMING_TTS_FACTORY", missing)
+    original_handler = sources.HANDLERS.get("fake", missing)
+    original_label = sources.SOURCE_LABELS.get("fake", missing)
+
+    def factory(out_folder, voice, rate, progress_cb=None):
+        return webapp.StreamingAudioBuilder(
+            out_folder, voice, rate, progress_cb=progress_cb,
+            words_per_chunk=10, max_concurrent=max_concurrent, tts_fn=fake_tts)
+
+    def fake_merge(paths, final_path):
+        merged_parts.extend(os.path.basename(path) for path in paths)
+        with open(final_path, "wb") as f:
+            f.write(b"merged")
+
+    webapp.OUTPUT_FOLDER = folder
+    webapp.STREAMING_TTS_FACTORY = factory
+    webapp._merge_via_ffmpeg_concat = fake_merge
+    webapp._merge_via_pydub = lambda paths, final_path: fake_merge(paths, final_path)
+    sources.HANDLERS["fake"] = handler
+    sources.SOURCE_LABELS["fake"] = "fake source"
+    webapp.reset_job_state(1, source="fake")
+
+    try:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            webapp.run_pipeline(
+                "https://example.test/book/chapter-1", 1,
+                "voice", "+0%", "fake")
+        state = dict(webapp.job_state)
+        result = {
+            "state": state,
+            "merged_parts": list(merged_parts),
+            "part_files": glob.glob(os.path.join(folder, "part*.mp3")),
+            "txt_exists": os.path.exists(os.path.join(folder, "book.txt")),
+            "mp3_exists": os.path.exists(os.path.join(folder, "book.mp3")),
+            "stderr": stderr.getvalue(),
+        }
+    finally:
+        sources.set_cancel_check(None)
+        webapp.OUTPUT_FOLDER = original_output
+        webapp._merge_via_ffmpeg_concat = original_merge
+        webapp._merge_via_pydub = original_fallback
+        if original_factory is missing:
+            delattr(webapp, "STREAMING_TTS_FACTORY")
+        else:
+            webapp.STREAMING_TTS_FACTORY = original_factory
+        if original_handler is missing:
+            sources.HANDLERS.pop("fake", None)
+        else:
+            sources.HANDLERS["fake"] = original_handler
+        if original_label is missing:
+            sources.SOURCE_LABELS.pop("fake", None)
+        else:
+            sources.SOURCE_LABELS["fake"] = original_label
+        with webapp.job_lock:
+            webapp.job_state.clear()
+            webapp.job_state.update(original_state)
+        shutil.rmtree(folder, ignore_errors=True)
+    return result
+
+
+def test_run_pipeline_starts_tts_before_source_returns():
+    import threading
+
+    tts_started = threading.Event()
+    source_saw_tts = []
+
+    def fake_tts(text, path, voice, rate):
+        tts_started.set()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def handler(url, max_pages, on_status, on_page, on_chapter=None):
+        assert on_chapter is not None
+        chapter = {"page": 1, "url": url, "title": "Chapter 1",
+                   "text": " ".join(f"w{i}" for i in range(25)),
+                   "chapter_num": 1}
+        on_chapter(chapter)
+        source_saw_tts.append(tts_started.wait(1))
+        return {"chapters": [chapter], "book_title": "Book"}
+
+    result = _run_fake_streaming_pipeline(handler, fake_tts)
+
+    assert source_saw_tts == [True]
+    assert result["state"]["status"] == "done"
+    assert result["state"]["mp3_ready"]
+    assert result["merged_parts"] == [
+        "part1.mp3", "part2.mp3", "part3.mp3"]
+    assert result["part_files"] == []
+    assert result["mp3_exists"]
+
+
+def test_source_failure_aborts_streaming_audio_and_removes_parts():
+    import threading
+    import time
+
+    tts_started = threading.Event()
+
+    def fake_tts(text, path, voice, rate):
+        tts_started.set()
+        time.sleep(0.05)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def handler(url, max_pages, on_status, on_page, on_chapter=None):
+        assert on_chapter is not None
+        on_chapter({"page": 1, "url": url, "title": "Chapter 1",
+                    "text": " ".join(["word"] * 10), "chapter_num": 1})
+        assert tts_started.wait(1)
+        raise sources.SourceError("source broke")
+
+    result = _run_fake_streaming_pipeline(handler, fake_tts)
+
+    assert tts_started.is_set()
+    assert result["state"]["status"] == "error"
+    assert not result["state"]["running"]
+    assert not result["state"]["mp3_ready"]
+    assert result["part_files"] == []
+    assert not result["mp3_exists"]
+
+
+def test_tts_failure_after_collection_keeps_txt_but_removes_audio_parts():
+    import threading
+
+    tts_failed = threading.Event()
+
+    def fake_tts(text, path, voice, rate):
+        tts_failed.set()
+        raise RuntimeError("tts broke")
+
+    def handler(url, max_pages, on_status, on_page, on_chapter=None):
+        assert on_chapter is not None
+        chapter = {"page": 1, "url": url, "title": "Chapter 1",
+                   "text": " ".join(["word"] * 10), "chapter_num": 1}
+        on_chapter(chapter)
+        assert tts_failed.wait(1)
+        return {"chapters": [chapter], "book_title": "Book"}
+
+    result = _run_fake_streaming_pipeline(handler, fake_tts)
+
+    assert result["state"]["status"] == "error"
+    assert result["state"]["txt_ready"]
+    assert result["txt_exists"]
+    assert "RuntimeError: tts broke" in result["stderr"]
+    assert result["part_files"] == []
+    assert not result["mp3_exists"]
+
+
+def test_cancellation_waits_for_streaming_workers_and_removes_parts():
+    import threading
+    import time
+    import app as webapp
+
+    tts_started = threading.Event()
+
+    def fake_tts(text, path, voice, rate):
+        tts_started.set()
+        time.sleep(0.05)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def handler(url, max_pages, on_status, on_page, on_chapter=None):
+        assert on_chapter is not None
+        on_chapter({"page": 1, "url": url, "title": "Chapter 1",
+                    "text": " ".join(["word"] * 10), "chapter_num": 1})
+        assert tts_started.wait(1)
+        webapp.update_state(cancel_requested=True)
+        sources.check_cancelled()
+
+    result = _run_fake_streaming_pipeline(handler, fake_tts)
+
+    assert result["state"]["status"] == "stopped"
+    assert not result["state"]["running"]
+    assert result["part_files"] == []
+    assert not result["mp3_exists"]
+
+
+def test_cancellation_during_audio_wait_prevents_queued_tts_from_starting():
+    import app as webapp
+
+    calls = []
+
+    def fake_tts(text, path, voice, rate):
+        calls.append(text)
+        if len(calls) == 1:
+            webapp.update_state(cancel_requested=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def handler(url, max_pages, on_status, on_page, on_chapter=None):
+        assert on_chapter is not None
+        chapter = {
+            "page": 1,
+            "url": url,
+            "title": "Chapter 1",
+            "text": " ".join(f"w{i}" for i in range(30)),
+            "chapter_num": 1,
+        }
+        on_chapter(chapter)
+        return {"chapters": [chapter], "book_title": "Book"}
+
+    result = _run_fake_streaming_pipeline(
+        handler, fake_tts, max_concurrent=1)
+
+    assert len(calls) == 1
+    assert result["state"]["status"] == "stopped"
+    assert result["part_files"] == []
+    assert not result["mp3_exists"]
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

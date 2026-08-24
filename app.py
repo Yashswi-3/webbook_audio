@@ -347,12 +347,15 @@ class StreamingAudioBuilder:
         if error is not None:
             raise error
 
+    def _run_tts(self, text, path):
+        sources.check_cancelled()
+        self.tts_fn(text, path, self.voice, self.rate)
+
     def _submit(self, text):
         index = len(self.part_paths) + 1
         path = os.path.join(self.out_folder, f"part{index}.mp3")
         self.part_paths.append(path)
-        future = self.executor.submit(
-            self.tts_fn, text, path, self.voice, self.rate)
+        future = self.executor.submit(self._run_tts, text, path)
         self.futures.append(future)
         future.add_done_callback(self._record_completion)
 
@@ -383,6 +386,7 @@ class StreamingAudioBuilder:
             for future in self.futures:
                 future.result()
             self._raise_if_failed()
+            sources.check_cancelled()
         except Exception:
             self.cleanup()
             raise
@@ -405,6 +409,9 @@ class StreamingAudioBuilder:
         self.closed = True
         self._shutdown(cancel_futures=True)
         self.cleanup()
+
+
+STREAMING_TTS_FACTORY = StreamingAudioBuilder
 
 
 async def _generate_chunks_concurrently(chunks, out_folder, voice, rate,
@@ -541,7 +548,7 @@ def generate_audio(text, out_folder, voice, rate, progress_cb=None,
 # Orchestration
 # ----------------------------------------------------------------------------
 
-def _write_and_narrate(chapters, book_title, voice, rate):
+def _write_and_narrate(chapters, book_title, voice, rate, audio_builder=None):
     """Shared tail of every job: book.txt, then book.mp3."""
     update_state(download_base=build_download_base(chapters, book_title))
     update_state(status="writing", message="Merging into book.txt...")
@@ -551,23 +558,49 @@ def _write_and_narrate(chapters, book_title, voice, rate):
         f.write(build_book_text(chapters))
     update_state(txt_ready=True)
 
-    # Narration source drops the "PAGE n / URL / ===" markers so the reader
-    # doesn't say the separators out loud - just flowing content.
-    audio_source = "\n\n".join(ch["text"] for ch in chapters)
-
     update_state(status="generating_audio",
                  message="Generating audio (this can take a while)...")
 
-    def audio_progress(done, total):
+    def wait_start(done, total):
         update_state(audio_chunks_done=done, audio_chunks_total=total,
                      message=f"Generating audio: chunk {done}/{total}")
 
-    def merge_start(n):
-        update_state(status="merging_audio",
-                     message=f"Merging {n} audio chunks into book.mp3...")
+    if audio_builder is None:
+        # Batch-compatible path for direct callers. Normal jobs create the
+        # builder before collection so these requests have already started.
+        audio_source = "\n\n".join(ch["text"] for ch in chapters)
 
-    generate_audio(audio_source, OUTPUT_FOLDER, voice, rate,
-                   progress_cb=audio_progress, on_merge_start=merge_start)
+        def audio_progress(done, total):
+            update_state(audio_chunks_done=done, audio_chunks_total=total,
+                         message=f"Generating audio: chunk {done}/{total}")
+
+        def merge_start(n):
+            update_state(status="merging_audio",
+                         message=f"Merging {n} audio chunks into book.mp3...")
+
+        generate_audio(audio_source, OUTPUT_FOLDER, voice, rate,
+                       progress_cb=audio_progress, on_merge_start=merge_start)
+    else:
+        part_paths = audio_builder.finish(on_wait_start=wait_start)
+        update_state(status="merging_audio",
+                     message=f"Merging {len(part_paths)} audio chunks into book.mp3...")
+        final_path = os.path.join(OUTPUT_FOLDER, "book.mp3")
+        try:
+            try:
+                _merge_via_ffmpeg_concat(part_paths, final_path)
+            except Exception:
+                traceback.print_exc()
+                print("Fast ffmpeg concat merge failed, falling back to pydub "
+                      "decode/re-encode merge (slower)...")
+                _merge_via_pydub(part_paths, final_path)
+        except Exception:
+            try:
+                os.remove(final_path)
+            except OSError:
+                pass
+            raise
+        finally:
+            audio_builder.cleanup()
 
     update_state(status="done", running=False, mp3_ready=True,
                  message="Done. book.txt and book.mp3 are ready.")
@@ -575,26 +608,48 @@ def _write_and_narrate(chapters, book_title, voice, rate):
 
 def run_pipeline(start_url, max_pages, voice, rate, source_name):
     """Run the reader picked in /start, then narrate whatever it returns."""
+    audio_builder = None
     try:
         handler = sources.HANDLERS[source_name]
         label = sources.SOURCE_LABELS.get(source_name, source_name)
         update_state(source=source_name, message=f"Reading {label}...")
 
+        def audio_progress(done, total):
+            kwargs = {"audio_chunks_done": done, "audio_chunks_total": total}
+            with job_lock:
+                if job_state["status"] == "generating_audio":
+                    kwargs["message"] = f"Generating audio: chunk {done}/{total}"
+            update_state(**kwargs)
+
+        audio_builder = STREAMING_TTS_FACTORY(
+            OUTPUT_FOLDER, voice, rate, progress_cb=audio_progress)
+
         def on_status(msg):
             update_state(message=msg)
 
-        result = handler(start_url, max_pages, on_status, append_page_log)
+        def on_chapter(chapter):
+            audio_builder.add_text(chapter["text"])
+
+        result = handler(start_url, max_pages, on_status, append_page_log,
+                         on_chapter)
         if result.get("warning"):
             update_state(warning=result["warning"])
-        _write_and_narrate(result["chapters"], result["book_title"], voice, rate)
+        _write_and_narrate(result["chapters"], result["book_title"], voice, rate,
+                           audio_builder=audio_builder)
 
     except sources.JobCancelled:
+        if audio_builder is not None:
+            audio_builder.abort()
         update_state(status="stopped", running=False,
                      message="Stopped. Anything already finished is still "
                              "downloadable below.")
     except SourceError as e:
+        if audio_builder is not None:
+            audio_builder.abort()
         update_state(status="error", running=False, message=str(e), error=str(e))
     except Exception as e:
+        if audio_builder is not None:
+            audio_builder.abort()
         traceback.print_exc()
         update_state(status="error", running=False,
                      message=f"Unexpected error: {e}", error=str(e))
@@ -639,18 +694,36 @@ def run_video_job(url):
 
 def run_pipeline_from_text(raw_text, source_name, voice, rate):
     """Uploaded .txt — skips fetching entirely, same narration tail."""
+    audio_builder = None
     try:
         update_state(source="upload", message=f"Reading {source_name}...")
+
+        def audio_progress(done, total):
+            update_state(audio_chunks_done=done, audio_chunks_total=total)
+
+        audio_builder = STREAMING_TTS_FACTORY(
+            OUTPUT_FOLDER, voice, rate, progress_cb=audio_progress)
+
+        def on_chapter(chapter):
+            audio_builder.add_text(chapter["text"])
+
         result = sources.fetch_uploaded_text(raw_text, source_name,
-                                             append_page_log)
-        _write_and_narrate(result["chapters"], result["book_title"], voice, rate)
+                                             append_page_log, on_chapter)
+        _write_and_narrate(result["chapters"], result["book_title"], voice, rate,
+                           audio_builder=audio_builder)
     except sources.JobCancelled:
+        if audio_builder is not None:
+            audio_builder.abort()
         update_state(status="stopped", running=False,
                      message="Stopped. Anything already finished is still "
                              "downloadable below.")
     except SourceError as e:
+        if audio_builder is not None:
+            audio_builder.abort()
         update_state(status="error", running=False, message=str(e), error=str(e))
     except Exception as e:
+        if audio_builder is not None:
+            audio_builder.abort()
         traceback.print_exc()
         update_state(status="error", running=False,
                      message=f"Unexpected error: {e}", error=str(e))
