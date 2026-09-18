@@ -41,7 +41,7 @@ import tempfile
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urljoin, urlparse, urlsplit
+from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -517,6 +517,54 @@ _JINA_HEADER_RE = re.compile(
 _MD_ANY_LINK_RE = re.compile(r"\[([^\]]*)\]\(([^)\s]+)\)")
 
 
+def parse_markdown_links(md):
+    """
+    [(label, url)] from Jina's markdown, counting nested parentheses.
+
+    A regex ending at the first ")" cannot read a URL that contains one, and
+    book slugs do: every one of the 296 chapter links on
+    ".../classroom-of-the-elite-...-(cote)_28776837400218905/catalog" came
+    back truncated at "(cote", lost the work id that scopes it to this book,
+    and was discarded - so a 148-chapter novel was narrated as one chapter.
+    Also drops the optional link title, as in `](url "Chapter One")`.
+    """
+    out = []
+    i = 0
+    md = md or ""
+    while True:
+        sep = md.find("](", i)
+        if sep == -1:
+            return out
+        open_bracket = md.rfind("[", 0, sep)
+        if open_bracket == -1:
+            i = sep + 2
+            continue
+        label = md[open_bracket + 1:sep]
+
+        j = sep + 2
+        depth = 1
+        while j < len(md) and depth:
+            char = md[j]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if not depth:
+                    break
+            elif char == chr(10):        # a link never spans a line
+                break
+            j += 1
+
+        if depth:                      # unbalanced - not a link, keep looking
+            i = sep + 2
+            continue
+
+        target = md[sep + 2:j].strip()
+        if target:
+            out.append((label, target.split()[0]))
+        i = j + 1
+
+
 def _retry_delay(attempt, retry_after):
     """
     Seconds to wait before retry `attempt`. Honours Retry-After in both forms
@@ -662,8 +710,8 @@ _MD_NEXT_LINK_RE = re.compile(r"\[([^\]]{0,40})\]\(([^)\s]+)\)")
 
 def find_next_link_markdown(md, current_url):
     """find_next_link's equivalent for Jina's markdown output."""
-    for label, href in _MD_NEXT_LINK_RE.findall(md or ""):
-        if NEXT_TEXT_RE.match(label.strip()):
+    for label, href in parse_markdown_links(md):
+        if len(label) <= 40 and NEXT_TEXT_RE.match(label.strip()):
             if href.startswith("#") or href.lower().startswith("javascript:"):
                 continue
             return urljoin(current_url, href)
@@ -1444,7 +1492,7 @@ def _page_links(url):
                  for a in soup.find_all("a", href=True)]
     else:
         title, _text, md = jina_read(url, with_links=True)
-        links = _MD_ANY_LINK_RE.findall(md)
+        links = parse_markdown_links(md)
 
     out = []
     for label, href in links:
@@ -1464,6 +1512,31 @@ _WORK_ID_RE = re.compile(r"\d{6,}")
 def work_ids(url):
     """The long numeric ids in a URL, which identify the work it belongs to."""
     return set(_WORK_ID_RE.findall(url or ""))
+
+
+_MOBILE_HOST_RE = re.compile(r"^(?:m|mobile|touch)\.", re.IGNORECASE)
+
+
+def desktop_equivalent(url):
+    """
+    The www. version of a mobile URL, or None if it isn't one.
+
+    Mobile pages are JavaScript shells: m.webnovel.com hands the reader three
+    links and no chapter list, while the identical book on www. lists 148.
+    A pasted phone URL therefore produced a one-chapter audiobook and blamed
+    the reader for it. Content extraction works fine on either host - only
+    the chapter index needs the desktop page.
+    """
+    parts = urlsplit(url)
+    if not _MOBILE_HOST_RE.match(parts.netloc or ""):
+        return None
+    return urlunsplit(parts._replace(
+        netloc=_MOBILE_HOST_RE.sub("www.", parts.netloc, count=1)))
+
+
+def _chapter_path(url):
+    """Path only, so the same chapter on m. and www. compares as one page."""
+    return urlsplit(url).path.rstrip("/")
 
 
 def _work_prefix(url):
@@ -1944,8 +2017,12 @@ def fetch_crawl(url, max_pages, on_status, on_page, on_chapter=None):
     if (chapters and current_url is None and len(chapters) < max_pages
             and looks_serial):
         on_status("No next link. Looking for the site's chapter list...")
+        index_start = desktop_equivalent(start_url) or start_url
+        if index_start != start_url:
+            on_status("That is the mobile site, which lists no chapters - "
+                      "reading the desktop version's index instead.")
         try:
-            listing = discover_chapter_list(start_url, on_status)
+            listing = discover_chapter_list(index_start, on_status)
         except SourceThrottled:
             throttled_looking_for_index = True
             listing = []
@@ -1954,11 +2031,15 @@ def fetch_crawl(url, max_pages, on_status, on_page, on_chapter=None):
 
         if len(listing) >= MIN_INDEX_LINKS:
             # Start where the user pointed us, if that page is in the list.
-            already = {c["url"] for c in chapters}
+            # By path, not by full URL: the pasted page may be the m. host
+            # while the index lists www., and comparing the two as strings
+            # made the crawl narrate the opening chapter twice.
+            already = {_chapter_path(c["url"]) for c in chapters}
             start_at = next((i for i, (_l, u) in enumerate(listing)
-                             if u in already), None)
+                             if _chapter_path(u) in already), None)
             remaining = listing[start_at + 1:] if start_at is not None else listing
-            remaining = [(l, u) for l, u in remaining if u not in already]
+            remaining = [(l, u) for l, u in remaining
+                         if _chapter_path(u) not in already]
 
             # Only "that's the whole book" if the index really did run out
             # first. Coming up short because chapters failed to read is a

@@ -1094,6 +1094,48 @@ def test_health_reports_configuration_without_leaking_the_key():
     assert empty["jina_key"] is False
 
 
+def test_markdown_links_survive_parentheses_in_the_url():
+    # The real shape that broke it: a book slug containing "(cote)", with the
+    # optional markdown link title after the URL. The old regex stopped at the
+    # first ")", so every chapter link lost the work id that scopes it to this
+    # book, all 296 were discarded, and a 148-chapter novel narrated as one.
+    md = (
+        '1. [_1_ **Childhood Friend!**](https://www.webnovel.com/book/'
+        'classroom-of-the-elite-i-have-the-ability-to-read-minds!-(cote)'
+        '_28776837400218905/childhood-friend!_77247248521555336 '
+        '"Childhood Friend!")' + chr(10) +
+        '2. [Next](https://example.test/plain/chapter-2)' + chr(10)
+    )
+    links = sources.parse_markdown_links(md)
+    assert len(links) == 2, links
+
+    first_url = links[0][1]
+    assert first_url.endswith("childhood-friend!_77247248521555336"), first_url
+    assert "(cote)_28776837400218905" in first_url
+    # The title must not be glued onto the URL.
+    assert '"' not in first_url
+    assert links[1][1] == "https://example.test/plain/chapter-2"
+
+    # And the id survives, which is the whole point - it is what scopes a
+    # chapter to this book rather than to the site's other novels.
+    assert "28776837400218905" in first_url
+
+
+def test_mobile_urls_use_the_desktop_host_for_the_chapter_index():
+    mobile = ("https://m.webnovel.com/book/some-book_12345678901/"
+              "a-chapter_22345678901")
+    assert sources.desktop_equivalent(mobile) == (
+        "https://www.webnovel.com/book/some-book_12345678901/"
+        "a-chapter_22345678901")
+    # Not a mobile host: left alone, so nothing is rewritten that shouldn't be.
+    assert sources.desktop_equivalent("https://www.webnovel.com/book/x") is None
+    assert sources.desktop_equivalent("https://example.test/mobile/x") is None
+    # Same chapter on either host compares equal, so the opening chapter is
+    # not collected twice when the index lists the desktop URLs.
+    assert (sources._chapter_path(mobile)
+            == sources._chapter_path(sources.desktop_equivalent(mobile)))
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
