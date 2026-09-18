@@ -1585,6 +1585,12 @@ def _belongs_to_work(url, ids, index_url, work_prefix=None):
     return urlsplit(url).path.startswith(index_path + "/") if index_path else False
 
 
+# Why the last filter run returned what it did. Every chapter-discovery bug
+# so far has surfaced as "1 of 25 collected" with nothing recorded about which
+# step threw the links away, leaving the cause to be reconstructed from source.
+LAST_FILTER_STATS = {}
+
+
 def find_chapter_links(links, index_url, ids=None, work_prefix=None):
     """
     Pick the chapter list out of a page's links.
@@ -1610,6 +1616,12 @@ def find_chapter_links(links, index_url, ids=None, work_prefix=None):
         if not _belongs_to_work(url, ids, index_url, work_prefix):
             continue
         groups.setdefault(_url_shape(url), []).append((label, url))
+
+    LAST_FILTER_STATS.update({
+        "links_on_page": len(links),
+        "belonged_to_this_work": sum(len(g) for g in groups.values()),
+        "biggest_shape_group": max((len(g) for g in groups.values()), default=0),
+    })
 
     if not groups:
         return []
@@ -1653,6 +1665,9 @@ def find_chapter_links(links, index_url, ids=None, work_prefix=None):
     if len(coarse_best) >= max(MIN_INDEX_LINKS, 2 * len(fine_best)):
         best = coarse_best
 
+    LAST_FILTER_STATS.update({"fine_unique": len(fine_best),
+                              "coarse_unique": len(coarse_best),
+                              "chosen": len(best)})
     if len(best) < MIN_INDEX_LINKS:
         return []
     return order_chapter_listing(best)
@@ -2137,6 +2152,15 @@ def fetch_crawl(url, max_pages, on_status, on_page, on_chapter=None):
             "\"next page\" link was found. Sites that paginate with a "
             "JavaScript button instead of a real link can't be followed."
         )
+        if LAST_FILTER_STATS.get("links_on_page"):
+            # Numbers, not a theory. "saw 920 links, 838 were this book's,
+            # kept 4" points straight at the filter; "saw 3 links" points at
+            # the page. Guessing between those cost a day.
+            warning += (
+                " Chapter list: saw {links_on_page} links on the index page, "
+                "{belonged_to_this_work} belonged to this book, kept "
+                "{chosen}.".format(**{"chosen": 0, **LAST_FILTER_STATS})
+            )
 
     # A hole in the numbering means a chapter was skipped mid-book. Say which
     # ones rather than shipping an mp3 that jumps from 1 to 3.

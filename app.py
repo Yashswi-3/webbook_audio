@@ -782,6 +782,9 @@ def health():
     """
     return jsonify({
         "ok": True,
+        # Which build is actually serving. Render sets this; without it there
+        # is no way to tell a deployed fix from a fix that was never deployed.
+        "commit": os.environ.get("RENDER_GIT_COMMIT", "")[:7] or "unknown",
         "jina_key": bool(sources.JINA_API_KEY),
         "github_token": bool(os.environ.get("GITHUB_TOKEN", "").strip()),
         "video_download_enabled": ALLOW_VIDEO_DOWNLOAD,
