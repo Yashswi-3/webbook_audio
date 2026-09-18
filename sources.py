@@ -72,6 +72,11 @@ PAGE_LOAD_WAIT_MS = 2500
 # Low on purpose: politeness to the site being read, and Jina's anonymous
 # limit is roughly 20 requests a minute.
 CHAPTER_FETCH_CONCURRENCY = 4
+# Without a key the reader allows 20 requests a minute for the whole host IP,
+# so four at a time burns the window in bursts and throttles itself. With a
+# key it is 500/min for this app alone and four is polite.
+CHAPTER_FETCH_CONCURRENCY_ANON = 2
+THROTTLE_COOLDOWN = 15.0
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 WebBookAudioReader/2.0"
@@ -1559,8 +1564,40 @@ def _work_prefix(url):
     all (the slug-only sites that broke the old id-only guard).
     """
     parsed = urlsplit(url)
-    trimmed = parsed.path.rstrip("/").rsplit("/", 1)[0]
+    segments = [seg for seg in parsed.path.rstrip("/").split("/") if seg]
+
+    # A bare "chapter" segment means the work lives above it:
+    # /fiction/61686/<slug>/chapter/3789241/<chapter-slug>. Trimming one
+    # segment left a prefix pointing at that single chapter, so no sibling
+    # chapter could start with it and the whole fiction was rejected. This is
+    # a URL convention, not a rule about one site.
+    for i, seg in enumerate(segments):
+        if seg.casefold() in ("chapter", "chapters") and i:
+            trimmed = "/" + "/".join(segments[:i])
+            break
+    else:
+        trimmed = parsed.path.rstrip("/").rsplit("/", 1)[0]
     return f"{parsed.scheme}://{parsed.netloc}{trimmed}"
+
+
+def work_identity(url):
+    """
+    (ids, prefix) naming the book a URL belongs to.
+
+    Ids come from the work prefix rather than the whole URL on purpose: the
+    full URL also carries the chapter's own id, and requiring that to match
+    rejected every other chapter of the same book.
+    """
+    prefix = _work_prefix(url)
+    segments = [seg for seg in urlsplit(prefix).path.split("/") if seg]
+
+    # A one-segment prefix is the site's shelf, not a book: /book/<id> trims
+    # to "/book", which every novel on webnovel starts with - and a pasted
+    # book page was read as six different novels in a row. When the pasted
+    # page IS the work, it is its own prefix.
+    if len(segments) <= 1:
+        return work_ids(url), url.rstrip("/")
+    return work_ids(prefix), prefix
 
 
 def _belongs_to_work(url, ids, index_url, work_prefix=None):
@@ -1639,13 +1676,18 @@ def find_chapter_links(links, index_url, ids=None, work_prefix=None):
         position = {}
         ordered = []
         for label, url in group:
-            if url in position:
-                index = position[url]
+            # Key on the path, not the whole URL: a contents page links the
+            # same chapter as ".../chapter-1" and ".../chapter-1/", and
+            # exact-string dedupe let both through, so the book opened by
+            # reading chapter one twice.
+            key = _chapter_path(url)
+            if key in position:
+                index = position[key]
                 if (extract_chapter_number(ordered[index][0], url) is None
                         and extract_chapter_number(label, url) is not None):
                     ordered[index] = (label, url)
                 continue
-            position[url] = len(ordered)
+            position[key] = len(ordered)
             ordered.append((label, url))
         return ordered
 
@@ -1753,8 +1795,7 @@ def discover_chapter_list(url, on_status):
     """
     # Taken from the URL the user pasted, so hopping to the book page can't
     # drift onto a different book's links.
-    ids = work_ids(url)
-    work_prefix = _work_prefix(url)
+    ids, work_prefix = work_identity(url)
 
     seen = set()
     queue = [url]
@@ -1793,8 +1834,17 @@ def discover_chapter_list(url, on_status):
         # novel on it. work_prefix's own guess-path fallback below covers
         # that case instead.
         parent = _parent_url(current)
-        if parent and ids and ids & work_ids(parent):
+        if parent and ((ids and ids & work_ids(parent))
+                       or (work_prefix and parent.startswith(work_prefix))):
             queue.append(parent)
+
+        # ...and the work's own root, which on plenty of sites simply is the
+        # contents page. Royal Road's fiction id is five digits, under the
+        # six-digit bar for an id, so `ids` came back empty, the climb above
+        # was gated on ids and never ran, and the one page listing every
+        # chapter was never opened.
+        if work_prefix and work_prefix not in seen:
+            queue.append(work_prefix)
 
         # ...and, once everything else is exhausted, the conventional index
         # paths under the work's own URL (the pasted URL minus its last
@@ -1820,6 +1870,10 @@ def _read_one_chapter(chapter_url):
     return title, clean_text(raw)
 
 
+# How the last batch of chapter reads went, for an honest closing message.
+LAST_READ_STATS = {}
+
+
 def read_chapter_urls(chapter_urls, start_page, max_count, on_status, on_page,
                       on_chapter=None):
     """
@@ -1834,13 +1888,16 @@ def read_chapter_urls(chapter_urls, start_page, max_count, on_status, on_page,
     anonymous limit is about 20 requests a minute.
     """
     chapters = []
+    LAST_READ_STATS.update({"throttled": 0, "failed": 0})
     wanted = chapter_urls[:max_count]
     total = len(wanted)
     if not total:
         return chapters
 
     check_cancelled()
-    pool = ThreadPoolExecutor(max_workers=min(CHAPTER_FETCH_CONCURRENCY, total))
+    concurrency = (CHAPTER_FETCH_CONCURRENCY if JINA_API_KEY
+                   else CHAPTER_FETCH_CONCURRENCY_ANON)
+    pool = ThreadPoolExecutor(max_workers=min(concurrency, total))
     futures = [pool.submit(_read_one_chapter, url) for _label, url in wanted]
 
     try:
@@ -1851,7 +1908,25 @@ def read_chapter_urls(chapter_urls, start_page, max_count, on_status, on_page,
 
             try:
                 title, text = futures[offset].result()
+            except SourceThrottled:
+                # A rate limit is not an unreadable chapter. Counting it as
+                # one left a hole in the book and a closing message blaming
+                # missing links, which sent the search for a cause into the
+                # wrong half of the code. Wait out the window and ask once
+                # more, on this thread, so nothing else is in flight.
+                on_status(f"Rate limited on chapter {offset + 1}; "
+                          f"waiting {int(THROTTLE_COOLDOWN)}s...")
+                time.sleep(THROTTLE_COOLDOWN)
+                try:
+                    title, text = _read_one_chapter(chapter_url)
+                except SourceError as retry_error:
+                    LAST_READ_STATS["throttled"] += 1
+                    on_page({"page": page_num, "url": chapter_url,
+                             "title": label, "words": 0, "ok": False,
+                             "note": f"Rate limited: {retry_error}"})
+                    continue
             except SourceError as e:
+                LAST_READ_STATS["failed"] += 1
                 on_page({"page": page_num, "url": chapter_url, "title": label,
                          "words": 0, "ok": False, "note": f"Failed: {e}"})
                 continue
@@ -1909,6 +1984,7 @@ def fetch_crawl(url, max_pages, on_status, on_page, on_chapter=None):
     next_is_guess = False       # the upcoming current_url came from a numeric guess
     prev_title = None           # to detect a guessed page that repeats the last one
     ran_past_last_chapter = False   # a guess landed past the end of the book
+    first_page_links = []           # page 1's own links, for the index check
 
     while current_url and page_num < max_pages:
         check_cancelled()
@@ -1976,6 +2052,13 @@ def fetch_crawl(url, max_pages, on_status, on_page, on_chapter=None):
                 raw_titles.append(j_title)
                 prev_title = j_title
 
+            if page_num == 1:
+                first_page_links = [
+                    (label, urljoin(current_url, href))
+                    for label, href in parse_markdown_links(j_md)
+                    if href and not href.startswith("#")
+                    and not href.lower().startswith("javascript:")]
+
             next_url = find_next_link_markdown(j_md, current_url)
             if not next_url:
                 # Reader-only sites like fanfiction.net put chapter nav in a
@@ -2040,6 +2123,13 @@ def fetch_crawl(url, max_pages, on_status, on_page, on_chapter=None):
 
         on_status(f"Page {page_num} complete ({len(chapters)} kept so far)")
 
+        if page_num == 1:
+            first_page_links = [
+                (a.get_text(" ", strip=True), urljoin(current_url, a["href"]))
+                for a in BeautifulSoup(html, "html.parser").find_all("a", href=True)
+                if a["href"] and not a["href"].startswith("#")
+                and not a["href"].lower().startswith("javascript:")]
+
         next_url = find_next_link(html, current_url)
         if not next_url:
             guess = guess_next_numeric_url(current_url)
@@ -2059,23 +2149,50 @@ def fetch_crawl(url, max_pages, on_status, on_page, on_chapter=None):
     # no chapter number anywhere, and searching a site-wide index for one costs
     # two reader round-trips that can only ever come back empty.
     throttled_looking_for_index = False
+
+    # The page the user pasted may itself be the book's contents page - people
+    # paste the novel, not chapter one. Such a page carries no chapter number
+    # anywhere, so the "does this look like a serial" gate below said no and
+    # the synopsis was narrated as the entire book. Its links are already in
+    # hand, so asking costs no requests.
+    own_listing = []
+    if first_page_links and len(chapters) < max_pages:
+        try:
+            own_ids, own_prefix = work_identity(start_url)
+            own_listing = find_chapter_links(first_page_links, start_url,
+                                             own_ids, own_prefix)
+        except (SourceError, ValueError):
+            own_listing = []
+
     looks_serial = any(c.get("chapter_num") for c in chapters) or \
+        len(own_listing) >= MIN_INDEX_LINKS or \
         extract_chapter_number("", start_url) is not None
 
+    # "Looks like a serial" is a cheap way to skip the index hunt for a
+    # standalone article, but it also skipped it for every book page whose
+    # mobile version lists nothing - and returning exactly one chapter is
+    # never the right answer to "read me 25". A single-chapter result always
+    # earns the hunt now; the cost is a few reader calls on an article that
+    # genuinely has no sequel.
     if (chapters and current_url is None and len(chapters) < max_pages
-            and looks_serial):
+            and (looks_serial or len(chapters) == 1)):
         on_status("No next link. Looking for the site's chapter list...")
-        index_start = desktop_equivalent(start_url) or start_url
-        if index_start != start_url:
-            on_status("That is the mobile site, which lists no chapters - "
-                      "reading the desktop version's index instead.")
-        try:
-            listing = discover_chapter_list(index_start, on_status)
-        except SourceThrottled:
-            throttled_looking_for_index = True
-            listing = []
-        except (SourceError, ValueError):
-            listing = []
+        if len(own_listing) >= MIN_INDEX_LINKS:
+            on_status(f"That page is the book's contents - "
+                      f"{len(own_listing)} chapters listed.")
+            listing = own_listing
+        else:
+            index_start = desktop_equivalent(start_url) or start_url
+            if index_start != start_url:
+                on_status("That is the mobile site, which lists no chapters - "
+                          "reading the desktop version's index instead.")
+            try:
+                listing = discover_chapter_list(index_start, on_status)
+            except SourceThrottled:
+                throttled_looking_for_index = True
+                listing = []
+            except (SourceError, ValueError):
+                listing = []
 
         if len(listing) >= MIN_INDEX_LINKS:
             # Start where the user pointed us, if that page is in the list.
@@ -2088,6 +2205,24 @@ def fetch_crawl(url, max_pages, on_status, on_page, on_chapter=None):
             remaining = listing[start_at + 1:] if start_at is not None else listing
             remaining = [(l, u) for l, u in remaining
                          if _chapter_path(u) not in already]
+
+            # Only ever continue forwards. Royal Road's fiction page lists the
+            # first few chapters and the newest ones, not all 500, so a crawl
+            # that began at chapter 331 found no entry matching where it was
+            # and took the list from the top - appending chapters 1 to 4 after
+            # 336. Splicing the beginning of a book onto the middle is worse
+            # than stopping, so drop anything that is not the next chapter on.
+            last_num = max((c.get("chapter_num") or 0) for c in chapters)
+            if last_num:
+                forward = [(l, u) for l, u in remaining
+                           if (extract_chapter_number(l, u) or 0) > last_num]
+                if not forward or (extract_chapter_number(*forward[0][::-1])
+                                   or 0) > last_num + 1:
+                    # Either nothing follows, or the only thing that follows
+                    # skips a stretch of the book. Say so rather than narrate
+                    # a jump.
+                    forward = []
+                remaining = forward
 
             # Only "that's the whole book" if the index really did run out
             # first. Coming up short because chapters failed to read is a
@@ -2110,7 +2245,14 @@ def fetch_crawl(url, max_pages, on_status, on_page, on_chapter=None):
     # Silently returning 1 chapter of the 50 that were asked for looks like a
     # bug. Say which limit was hit instead.
     warning = None
-    if throttled_looking_for_index and len(chapters) < max_pages:
+    if LAST_READ_STATS.get("throttled") and len(chapters) < max_pages:
+        warning = (
+            f"Collected {len(chapters)} of {max_pages}: the reader rate "
+            f"limited {LAST_READ_STATS['throttled']} chapter(s), so they were "
+            "left out. This is temporary - try again in a minute. A free "
+            "JINA_API_KEY on this server raises the limit 25x and stops it."
+        )
+    elif throttled_looking_for_index and len(chapters) < max_pages:
         # Only branch here that means "ask again shortly" rather than "this is
         # everything there is", so it has to be checked before the others.
         warning = (
@@ -2124,10 +2266,23 @@ def fetch_crawl(url, max_pages, on_status, on_page, on_chapter=None):
         # First, because the reader message below would otherwise blame the
         # reader for a chain that was in fact followed all the way to the
         # end of the book.
-        warning = (
-            f"Reached the end: {len(chapters)} chapters is everything this "
-            f"book has, rather than the {max_pages} requested."
-        )
+        started_at = chapters[0].get("chapter_num")
+        ended_at = chapters[-1].get("chapter_num")
+        if started_at and started_at > 1:
+            # "Everything this book has" is wrong when the pasted link was
+            # chapter 44 of 46 - it reads as a failure when the crawl in fact
+            # did everything it could from where it was pointed.
+            warning = (
+                f"Reached the end of the book at chapter {ended_at}. You "
+                f"started at chapter {started_at}, so {len(chapters)} "
+                f"chapters is everything after it, not the {max_pages} "
+                "requested. Paste an earlier chapter to get more."
+            )
+        else:
+            warning = (
+                f"Reached the end: {len(chapters)} chapters is everything this "
+                f"book has, rather than the {max_pages} requested."
+            )
     elif used_reader_fallback and len(chapters) < max_pages:
         warning = (
             f"Stopped after {len(chapters)} of {max_pages} requested. This "
