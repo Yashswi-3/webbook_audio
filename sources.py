@@ -771,6 +771,11 @@ CHAPTER_NUM_URL_RE = re.compile(r"chapter[-_ ]?(\d+)", re.IGNORECASE)
 # fanfiction.net-style tail: "..., a loud house fanfic".
 _FANFIC_TAIL_RE = re.compile(r",\s*a\s+.+?\bfanfic\b\s*$", re.IGNORECASE)
 _BARE_NUM_SEGMENT_RE = re.compile(r"^\d{1,5}$")
+# A catalog row renders as "_2_**02 - Biological Evolution**7 months ago" - the
+# leading _N_ is the chapter's position and nothing else in the label says so.
+# Unread, the whole listing counts as unnumbered, the reading-order sort is
+# skipped, and the book narrates 1, 444, 2, 3 in the site's own catalog order.
+_LEADING_INDEX_RE = re.compile(r"^\s*_(\d{1,5})_")
 
 
 def _registrable_part(netloc):
@@ -863,6 +868,9 @@ def extract_chapter_number(chapter_title, url):
     fanfiction.net's /s/13857537/1/ has no other signal, and the 8-digit
     story id right before it must not be mistaken for the chapter number.
     """
+    m = _LEADING_INDEX_RE.match(chapter_title or "")
+    if m:
+        return int(m.group(1))
     m = CHAPTER_MARKER_RE.search(chapter_title or "")
     if m:
         return int(m.group(1))
@@ -1606,23 +1614,48 @@ def find_chapter_links(links, index_url, ids=None, work_prefix=None):
     if not groups:
         return []
 
-    best = max(groups.values(), key=len)
-    if len(best) < MIN_INDEX_LINKS:
-        coarse_groups = {}
-        for label, url in [item for grp in groups.values() for item in grp]:
-            coarse_groups.setdefault(_coarse_url_shape(url), []).append((label, url))
-        coarse_best = max(coarse_groups.values(), key=len) if coarse_groups else []
-        if len(coarse_best) >= MIN_INDEX_LINKS:
-            best = coarse_best
-        else:
-            return []
-
-    seen, ordered = set(), []
-    for label, url in best:
-        if url not in seen:
-            seen.add(url)
+    def unique(group):
+        # Deduplicate before anything is measured. A catalog links the same
+        # chapter twice (the cover tile and the list row), so a group of 8 can
+        # be 4 chapters - and counting it before dedupe let an 8-link group
+        # clear the threshold and win, while the coarse pass that would have
+        # found all 838 chapters of the book never ran.
+        # Keep the most informative label for a repeated URL. A catalog's
+        # "Read" button points at chapter one, so first-wins stored chapter
+        # one as "Read" - unnumbered, sorted to the end, and reported as a
+        # gap in the middle of the book.
+        position = {}
+        ordered = []
+        for label, url in group:
+            if url in position:
+                index = position[url]
+                if (extract_chapter_number(ordered[index][0], url) is None
+                        and extract_chapter_number(label, url) is not None):
+                    ordered[index] = (label, url)
+                continue
+            position[url] = len(ordered)
             ordered.append((label, url))
-    return order_chapter_listing(ordered)
+        return ordered
+
+    fine_best = unique(max(groups.values(), key=len))
+
+    coarse_groups = {}
+    for label, url in [item for grp in groups.values() for item in grp]:
+        coarse_groups.setdefault(_coarse_url_shape(url), []).append((label, url))
+    coarse_best = unique(max(coarse_groups.values(), key=len)) if coarse_groups else []
+
+    # Prefer the coarse grouping when it finds substantially more. Every link
+    # here already belongs to this work, so a coarser shape cannot drag in
+    # another novel - it only reunites siblings that a chapter's own title
+    # slug had split apart. Requiring a clear margin keeps the fine grouping
+    # in charge on sites where it is genuinely the right answer.
+    best = fine_best
+    if len(coarse_best) >= max(MIN_INDEX_LINKS, 2 * len(fine_best)):
+        best = coarse_best
+
+    if len(best) < MIN_INDEX_LINKS:
+        return []
+    return order_chapter_listing(best)
 
 
 def order_chapter_listing(listing):

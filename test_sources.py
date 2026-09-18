@@ -1136,6 +1136,65 @@ def test_mobile_urls_use_the_desktop_host_for_the_chapter_index():
             == sources._chapter_path(sources.desktop_equivalent(mobile)))
 
 
+def test_a_repeated_slug_group_cannot_beat_the_whole_catalog():
+    # Real shape from webnovel's catalog: hundreds of chapters whose URLs each
+    # carry their own title slug, plus one slug that recurs. The recurring
+    # group had 8 entries - exactly MIN_INDEX_LINKS - so it won before anything
+    # was deduplicated, collapsed to 4 unique URLs, and 838 real chapters were
+    # never seen. The book narrated one chapter.
+    book = "https://site.test/book/a-novel_34614898400796905"
+    words = ["child", "titans", "survey-corps", "shiganshina", "the-fall",
+             "historia", "past", "wall", "scouts", "trost", "female", "armour"]
+    links = []
+    for n in range(1, 60):
+        # Each chapter's own title slug, so every URL has a different fine
+        # shape and no single fine group can represent the book.
+        slug = f"{words[n % len(words)]}-{n}"
+        links.append((f"_{n}_ **Chapter {n}**",
+                      f"{book}/chapter-{n}-{slug}_9294247488395{n:04d}"))
+    for n in range(60, 64):                       # 4 chapters, each linked twice
+        url = f"{book}/chapter-{n}-reunion_9294247488395{n:04d}"
+        links.append((f"_{n}_ **Chapter {n}**", url))
+        links.append((f"_{n}_ **Chapter {n}**", url))
+
+    found = sources.find_chapter_links(links, book + "/catalog",
+                                       {"34614898400796905"}, book)
+    assert len(found) == 63, len(found)
+    assert [sources.extract_chapter_number(l, u) for l, u in found][:5] == [1, 2, 3, 4, 5]
+
+
+def test_a_catalog_row_states_its_chapter_number_in_the_label():
+    # webnovel renders a row as "_2_**02 - Biological Evolution**7 months ago".
+    # Unparsed, the whole listing counts as unnumbered, the reading-order sort
+    # is skipped, and the catalog's own order (1, 444, 2, 3...) is narrated.
+    assert sources.extract_chapter_number(
+        "_2_**02 - Biological Evolution**7 months ago", "https://x.test/a") == 2
+    assert sources.extract_chapter_number(
+        "_444_ **Chapter 444: Beautiful View**", "https://x.test/b") == 444
+    # Existing forms keep working.
+    assert sources.extract_chapter_number("Chapter 7: Vance", "https://x.test/c") == 7
+    assert sources.extract_chapter_number("A title", "https://x.test/d") is None
+
+
+def test_the_read_button_does_not_steal_chapter_ones_label():
+    # A catalog's "Read" button points at chapter one. First-label-wins stored
+    # chapter one as "Read", which carries no number, so it sorted to the end
+    # and the book was reported as missing its own first chapter.
+    book = "https://site.test/book/a-novel_11111111111"
+    first = f"{book}/chapter-1-start_2222222222201"
+    links = [("Read", first)]
+    for n in range(1, 12):
+        links.append((f"_{n}_ **Chapter {n}**",
+                      f"{book}/chapter-{n}-slug-{n}_222222222220{n}"))
+
+    found = sources.find_chapter_links(links, book + "/catalog",
+                                       {"11111111111"}, book)
+    numbers = [sources.extract_chapter_number(l, u) for l, u in found]
+    assert None not in numbers, found[:3]
+    assert numbers == sorted(numbers), numbers
+    assert numbers[0] == 1
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
