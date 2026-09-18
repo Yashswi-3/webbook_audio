@@ -27,10 +27,12 @@ Handler contract:
 
 import base64
 import glob as _glob
+import email.utils
 import html as _html
 import ipaddress
 import json
 import os
+import random
 import re
 import socket
 import subprocess
@@ -85,6 +87,14 @@ JINA_MAX_BYTES = 5 * 1024 * 1024
 # r.jina.ai; a short honest agent string gets 200. Don't "upgrade" this to the
 # browser UA.
 JINA_USER_AGENT = "WebBookAudioReader/2.0"
+# Anonymous Jina is 20 requests/minute enforced per client IP, and a cloud host
+# shares that IP with every other tenant on its NAT gateway - so a 429 here is
+# routine and says nothing about the book. Retry it properly. A free JINA_API_KEY
+# raises the ceiling to 500/min tracked per key instead of per IP, which is the
+# single most effective setting on a deployed instance.
+JINA_ATTEMPTS = 3
+JINA_BACKOFF_BASE = 2.0        # seconds; doubled per attempt, plus jitter
+JINA_MAX_SLEEP = 30.0          # never sit on a Retry-After longer than this
 
 # Below this word count a local extraction is treated as a failure and the
 # Jina Reader rescue path is tried. JS-rendered pages land here on servers
@@ -125,6 +135,17 @@ GITHUB_API = "https://api.github.com"
 
 class SourceError(Exception):
     """Anything that should stop the job and be shown to the user verbatim."""
+
+
+class SourceThrottled(SourceError):
+    """
+    A source refused *for now* — a rate limit, not an absence of content.
+
+    These need opposite handling and used to be the same exception, which is
+    how a rate-limited index page came back as "this book has no chapter
+    list" and narrated 1 chapter of the 25 asked for. A throttle is retried,
+    and if it survives that, it is reported as a throttle.
+    """
 
 
 class JobCancelled(Exception):
@@ -358,17 +379,40 @@ def download_page_html(url):
         resp.raise_for_status()
         return resp.text, None
     except requests.RequestException as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status in _DIRECT_REFUSAL_STATUS:
+            _direct_refused_hosts.add((urlparse(url).netloc or "").casefold())
         detail = f"{e}"
         if playwright_error:
             detail += f" (Playwright also failed: {playwright_error})"
         return None, detail
 
 
+# Hosts that refused a direct fetch during this job. Cloudflare scores whole
+# datacenter networks as low-trust, so a 403 from a host is a property of the
+# host and this server - not of the page. Re-asking it for every chapter costs
+# two wasted round-trips per page and is rude besides.
+_DIRECT_REFUSAL_STATUS = {401, 403, 406, 429, 451}
+_direct_refused_hosts = set()
+
+
+def reset_fetch_memory():
+    """Forget which hosts refused. Called once per job, never mid-crawl."""
+    _direct_refused_hosts.clear()
+
+
 def fetch_with_retry(url):
     """Fetch a page, retrying once on failure/timeout."""
+    host = (urlparse(url).netloc or "").casefold()
+    if host in _direct_refused_hosts:
+        return None, ("this host refused a direct fetch earlier in this job, "
+                      "so the reader was used instead")
+
     html, err = download_page_html(url)
     if html is not None:
         return html, None
+    if host in _direct_refused_hosts:
+        return None, err          # recorded during that attempt; don't retry
     time.sleep(1.5)
     return download_page_html(url)
 
@@ -473,6 +517,61 @@ _JINA_HEADER_RE = re.compile(
 _MD_ANY_LINK_RE = re.compile(r"\[([^\]]*)\]\(([^)\s]+)\)")
 
 
+def _retry_delay(attempt, retry_after):
+    """
+    Seconds to wait before retry `attempt`. Honours Retry-After in both forms
+    RFC 9110 allows - a plain integer and an HTTP-date - because a server that
+    tells you when to come back is the cheapest signal available.
+    """
+    if retry_after:
+        raw = retry_after.strip()
+        try:
+            return max(0.0, min(float(raw), JINA_MAX_SLEEP))
+        except ValueError:
+            try:
+                when = email.utils.parsedate_to_datetime(raw)
+            except (TypeError, ValueError):
+                when = None
+            if when is not None:
+                delay = when.timestamp() - time.time()
+                return max(0.0, min(delay, JINA_MAX_SLEEP))
+    # No usable header: exponential backoff with jitter. The jitter matters
+    # because the chapter fetches run several at a time - without it they are
+    # throttled together, sleep the same length, and stampede the limit again.
+    backoff = JINA_BACKOFF_BASE * (2 ** (attempt - 1))
+    return min(backoff + random.uniform(0, JINA_BACKOFF_BASE), JINA_MAX_SLEEP)
+
+
+# A reader can return HTTP 200 carrying the target's bot-check page instead of
+# the article. Narrating "Enable JavaScript and cookies to continue" as chapter
+# one is worse than failing, so short results get checked for these.
+_CHALLENGE_SIGNS = (
+    "enable javascript and cookies",
+    "checking your browser",
+    "just a moment",
+    "attention required",
+    "verify you are human",
+    "are you a robot",
+    "performing security verification",
+    "cf-browser-verification",
+    "/cdn-cgi/challenge-platform/",
+)
+
+
+def looks_like_challenge_text(text):
+    """
+    True when short text looks like a bot-check page rather than prose.
+
+    Gated on length on purpose: a real chapter may well contain the words
+    "just a moment", and flagging a 3,000-word chapter as a challenge would
+    throw away a page that was read perfectly well.
+    """
+    if not text or len(text.split()) >= MIN_ARTICLE_WORDS:
+        return False
+    lowered = text[:4096].casefold()
+    return any(sign in lowered for sign in _CHALLENGE_SIGNS)
+
+
 def jina_read(url, with_links=False):
     """
     Read any page through Jina Reader and return (title, markdown).
@@ -494,13 +593,38 @@ def jina_read(url, with_links=False):
     if JINA_API_KEY:
         headers["Authorization"] = f"Bearer {JINA_API_KEY}"
 
-    try:
-        resp = requests.get(JINA_ENDPOINT + url, headers=headers,
-                            timeout=JINA_TIMEOUT, stream=True)
-        resp.raise_for_status()
-        body = resp.raw.read(JINA_MAX_BYTES + 1, decode_content=True)
-    except requests.RequestException as e:
-        raise SourceError(f"Jina Reader failed: {e}") from e
+    body = None
+    last_error = None
+    for attempt in range(1, JINA_ATTEMPTS + 1):
+        check_cancelled()
+        try:
+            resp = requests.get(JINA_ENDPOINT + url, headers=headers,
+                                timeout=JINA_TIMEOUT, stream=True)
+            if resp.status_code == 429:
+                last_error = "rate limited (HTTP 429)"
+                if attempt == JINA_ATTEMPTS:
+                    break
+                time.sleep(_retry_delay(attempt, resp.headers.get("Retry-After")))
+                continue
+            resp.raise_for_status()
+            body = resp.raw.read(JINA_MAX_BYTES + 1, decode_content=True)
+            break
+        except requests.RequestException as e:
+            last_error = str(e)
+            if attempt == JINA_ATTEMPTS:
+                raise SourceError(f"Jina Reader failed: {e}") from e
+            time.sleep(_retry_delay(attempt, None))
+
+    if body is None:
+        # Out of attempts against a rate limit. Say that, rather than letting a
+        # caller read it as "this page has nothing" - the difference decides
+        # whether the user is told to retry or told the book ended.
+        raise SourceThrottled(
+            f"Jina Reader is rate limiting this server ({last_error}). "
+            "Anonymous use is 20 requests/minute shared across everything on "
+            "this host's IP; setting a free JINA_API_KEY raises it to 500/min "
+            "for this app alone."
+        )
 
     if len(body) > JINA_MAX_BYTES:
         raise SourceError("Jina Reader response exceeded 5 MB.")
@@ -518,10 +642,19 @@ def jina_read(url, with_links=False):
         title = m.group(1).strip()
 
     stripped = _JINA_HEADER_RE.sub("", text, count=1)
+    prose = markdown_to_speech_text(stripped)
+    if looks_like_challenge_text(prose):
+        # The reader answered 200 but what it read was the target's bot check.
+        # Narrating that as a chapter is the worst outcome available.
+        raise SourceError(
+            "The reader reached that page but got the site's bot-check screen "
+            "instead of the text. This tool does not work around those."
+        )
+
     # Raw markdown comes back too: it still has the page's links in it, which
     # is the only way to keep following a chapter chain when the direct fetch
     # is blocked and there is no HTML to run find_next_link over.
-    return title, markdown_to_speech_text(stripped), stripped
+    return title, prose, stripped
 
 
 _MD_NEXT_LINK_RE = re.compile(r"\[([^\]]{0,40})\]\(([^)\s]+)\)")
@@ -1514,6 +1647,11 @@ def discover_chapter_list(url, on_status):
 
         try:
             links, _title = _page_links(current)
+        except SourceThrottled:
+            # Deliberately not caught: a throttled index page is not a page
+            # without chapters, and treating it as one is what silently
+            # produced a one-chapter book out of a fifty-chapter request.
+            raise
         except SourceError:
             links = []
 
@@ -1640,6 +1778,7 @@ def fetch_crawl(url, max_pages, on_status, on_page, on_chapter=None):
     """
     current_url = normalize_public_url(url)
     start_url = current_url
+    reset_fetch_memory()
     chapters = []
     visited = set()
     page_num = 0
@@ -1798,6 +1937,7 @@ def fetch_crawl(url, max_pages, on_status, on_page, on_chapter=None):
     # Gate on the page looking like part of a series. A standalone article has
     # no chapter number anywhere, and searching a site-wide index for one costs
     # two reader round-trips that can only ever come back empty.
+    throttled_looking_for_index = False
     looks_serial = any(c.get("chapter_num") for c in chapters) or \
         extract_chapter_number("", start_url) is not None
 
@@ -1806,6 +1946,9 @@ def fetch_crawl(url, max_pages, on_status, on_page, on_chapter=None):
         on_status("No next link. Looking for the site's chapter list...")
         try:
             listing = discover_chapter_list(start_url, on_status)
+        except SourceThrottled:
+            throttled_looking_for_index = True
+            listing = []
         except (SourceError, ValueError):
             listing = []
 
@@ -1838,7 +1981,17 @@ def fetch_crawl(url, max_pages, on_status, on_page, on_chapter=None):
     # Silently returning 1 chapter of the 50 that were asked for looks like a
     # bug. Say which limit was hit instead.
     warning = None
-    if ran_past_last_chapter and len(chapters) < max_pages:
+    if throttled_looking_for_index and len(chapters) < max_pages:
+        # Only branch here that means "ask again shortly" rather than "this is
+        # everything there is", so it has to be checked before the others.
+        warning = (
+            f"Stopped after {len(chapters)} of {max_pages} requested: the "
+            "reader was rate limited while looking for this book's chapter "
+            "list, so the rest could not be found. This is temporary - try "
+            "again in a minute. Setting a free JINA_API_KEY on this server "
+            "raises that limit 25x and stops it happening."
+        )
+    elif ran_past_last_chapter and len(chapters) < max_pages:
         # First, because the reader message below would otherwise blame the
         # reader for a chain that was in fact followed all the way to the
         # end of the book.

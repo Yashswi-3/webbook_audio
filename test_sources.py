@@ -954,6 +954,120 @@ def test_cancellation_during_audio_wait_prevents_queued_tts_from_starting():
     assert not result["mp3_exists"]
 
 
+def test_retry_delay_honours_retry_after_in_both_legal_forms():
+    import email.utils
+    import time
+
+    # Plain seconds.
+    assert sources._retry_delay(1, "7") == 7.0
+    # An HTTP-date, which RFC 9110 allows and a naive int() parse would drop
+    # on the floor - retrying instantly and earning a longer ban.
+    when = email.utils.formatdate(time.time() + 9, usegmt=True)
+    assert 5 <= sources._retry_delay(1, when) <= 12
+    # Nonsense header falls back to backoff rather than raising.
+    assert sources._retry_delay(1, "soon") > 0
+    # No header: backoff grows, and jitter keeps concurrent callers apart.
+    assert sources._retry_delay(3, None) > sources._retry_delay(1, None) - 0.001
+    assert sources._retry_delay(9, None) <= sources.JINA_MAX_SLEEP
+
+
+def test_jina_retries_a_429_then_reports_it_as_a_throttle():
+    calls = []
+
+    class Fake429:
+        status_code = 429
+        headers = {"Retry-After": "0"}
+
+    original_get = sources.requests.get
+    original_sleep = sources.time.sleep
+    sources.requests.get = lambda *a, **k: (calls.append(1), Fake429())[1]
+    sources.time.sleep = lambda seconds: None
+    try:
+        raised = None
+        try:
+            sources.jina_read("https://example.test/chapter-1")
+        except sources.SourceError as e:
+            raised = e
+    finally:
+        sources.requests.get = original_get
+        sources.time.sleep = original_sleep
+
+    assert len(calls) == sources.JINA_ATTEMPTS, calls
+    # A throttle, specifically: callers branch on this to keep a rate limit
+    # from being reported as a book that has no more chapters.
+    assert isinstance(raised, sources.SourceThrottled), raised
+    assert "rate limit" in str(raised).lower()
+
+
+def test_a_bot_check_page_is_never_narrated_as_a_chapter():
+    challenge = ("Just a moment... Enable JavaScript and cookies to continue. "
+                 "Ray ID 8f2c")
+    assert sources.looks_like_challenge_text(challenge)
+    # Length gate: a real chapter is allowed to contain those words.
+    real_chapter = challenge + " " + " ".join(f"word{i}" for i in range(400))
+    assert not sources.looks_like_challenge_text(real_chapter)
+    assert not sources.looks_like_challenge_text("")
+
+
+def test_a_host_that_refused_once_is_not_asked_again_this_job():
+    attempts = []
+
+    def fake_download(url):
+        attempts.append(url)
+        error = sources.requests.exceptions.HTTPError("403 Client Error")
+        error.response = type("R", (), {"status_code": 403})()
+        raise error
+
+    def guarded(url):
+        try:
+            fake_download(url)
+        except sources.requests.RequestException as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status in sources._DIRECT_REFUSAL_STATUS:
+                sources._direct_refused_hosts.add(
+                    sources.urlparse(url).netloc.casefold())
+            return None, str(e)
+
+    original = sources.download_page_html
+    sources.download_page_html = guarded
+    sources.reset_fetch_memory()
+    try:
+        first_html, first_err = sources.fetch_with_retry(
+            "https://blocked.test/chapter-1")
+        second_html, second_err = sources.fetch_with_retry(
+            "https://blocked.test/chapter-2")
+    finally:
+        sources.download_page_html = original
+        sources.reset_fetch_memory()
+
+    assert first_html is None and second_html is None
+    # One refused request, not four: the second page skipped the direct fetch
+    # and the retry entirely and went straight to the reader.
+    assert len(attempts) == 1, attempts
+    assert "refused a direct fetch earlier" in second_err
+
+
+def test_a_throttled_index_is_not_reported_as_a_book_without_chapters():
+    def throttled(url):
+        raise sources.SourceThrottled("Jina Reader is rate limiting this server")
+
+    original = sources._page_links
+    sources._page_links = throttled
+    try:
+        raised = None
+        try:
+            sources.discover_chapter_list("https://example.test/book/123456/c1",
+                                          lambda message: None)
+        except sources.SourceThrottled as e:
+            raised = e
+    finally:
+        sources._page_links = original
+
+    # Not [] - an empty listing here reads as "this site has no chapter list",
+    # which is how a rate limit became a one-chapter audiobook.
+    assert raised is not None
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

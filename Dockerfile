@@ -16,6 +16,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 ENV PORT=10000
+# YouTube blocks datacenter IPs, so both video routes can only fail here,
+# and a public MP4 endpoint is bandwidth plus an abuse target. Off by
+# default in any container; local runs (python app.py) still have it on.
+ENV ALLOW_VIDEO_DOWNLOAD=0
 EXPOSE 10000
 
 # shell form so $PORT expands - Render assigns the port at runtime
