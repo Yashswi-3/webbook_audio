@@ -1068,6 +1068,32 @@ def test_a_throttled_index_is_not_reported_as_a_book_without_chapters():
     assert raised is not None
 
 
+def test_health_reports_configuration_without_leaking_the_key():
+    import app as webapp
+
+    original = sources.JINA_API_KEY
+    try:
+        sources.JINA_API_KEY = "jina_secret_value"
+        body = webapp.app.test_client().get("/health").get_json()
+    finally:
+        sources.JINA_API_KEY = original
+
+    assert body["ok"] is True
+    assert body["jina_key"] is True
+    # The whole point: a boolean, never the value. Anyone can call /health.
+    assert "jina_secret_value" not in str(body)
+    for field in ("ffmpeg", "edge_tts", "video_download_enabled", "job_running"):
+        assert isinstance(body[field], bool), field
+
+    original2 = sources.JINA_API_KEY
+    try:
+        sources.JINA_API_KEY = ""
+        empty = webapp.app.test_client().get("/health").get_json()
+    finally:
+        sources.JINA_API_KEY = original2
+    assert empty["jina_key"] is False
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

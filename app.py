@@ -24,6 +24,7 @@ import asyncio
 import glob
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -766,6 +767,28 @@ def index():
                            max_upload_size_mb=MAX_UPLOAD_SIZE_MB,
                            allow_video=ALLOW_VIDEO_DOWNLOAD,
                            max_video_mb=sources.MAX_VIDEO_MB)
+
+
+@app.route("/health")
+def health():
+    """
+    Is this instance configured the way it was meant to be?
+
+    Environment variables are invisible over HTTP, so "I set JINA_API_KEY"
+    and "this process has JINA_API_KEY" were impossible to tell apart - the
+    classic version being a variable set on the wrong service, or set without
+    the restart that loads it. Reports booleans only; the key's value never
+    leaves the process.
+    """
+    return jsonify({
+        "ok": True,
+        "jina_key": bool(sources.JINA_API_KEY),
+        "github_token": bool(os.environ.get("GITHUB_TOKEN", "").strip()),
+        "video_download_enabled": ALLOW_VIDEO_DOWNLOAD,
+        "ffmpeg": shutil.which("ffmpeg") is not None,
+        "edge_tts": edge_tts is not None,
+        "job_running": job_state["running"],
+    })
 
 
 @app.route("/detect")
